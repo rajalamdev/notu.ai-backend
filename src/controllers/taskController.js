@@ -1,4 +1,7 @@
+const mongoose = require('mongoose');
 const Task = require('../models/Task');
+const Board = require('../models/Board');
+const { emitToBoard } = require('../services/socketService');
 const logger = require('../utils/logger');
 
 /**
@@ -71,21 +74,35 @@ const getTaskById = async (req, res) => {
  */
 const createTask = async (req, res) => {
   try {
-const { title, description, status, priority, dueDate, assignee, tags, meetingId, boardId } = req.body;
+    const { title, description, status: rawStatus, priority, dueDate, assignee, labels, meetingId, boardId } = req.body;
     
     if (!title) {
-      return res.status(400).json({
-        success: false,
-        message: 'Title is required',
-      });
+      return res.status(400).json({ success: false, message: 'Title is required' });
     }
+
+    // Access check
+    if (boardId) {
+      const board = await Board.findById(boardId);
+      if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
+      
+      const isOwner = board.userId.toString() === req.user.id;
+      const col = board.collaborators.find(c => c.user && c.user.toString() === req.user.id);
+      const isEditor = col && (col.role === 'editor' || col.role === 'owner');
+
+      if (!isOwner && !isEditor) {
+        return res.status(403).json({ success: false, message: 'Only owners and editors can create tasks' });
+      }
+    }
+
+    // Fix status mapping
+    const status = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
     
-    // Get max order for the status
-    const maxOrderTask = await Task.findOne({ 
-      userId: req.user.id, 
-      status: status || 'todo' 
-    }).sort({ order: -1 });
-    
+    // Get max order
+    const query = { status: status || 'todo' };
+    if (boardId) query.boardId = boardId;
+    else query.userId = req.user.id;
+
+    const maxOrderTask = await Task.findOne(query).sort({ order: -1 });
     const order = maxOrderTask ? maxOrderTask.order + 1 : 0;
     
     const task = await Task.create({
@@ -95,9 +112,8 @@ const { title, description, status, priority, dueDate, assignee, tags, meetingId
       status: status || 'todo',
       priority: priority || 'medium',
       dueDate,
-      assignee,
-      tags,
-      meetingId,
+      assignee: (assignee && mongoose.Types.ObjectId.isValid(assignee)) ? assignee : null,
+      labels: labels || [],
       meetingId,
       boardId,
       order,
@@ -105,18 +121,20 @@ const { title, description, status, priority, dueDate, assignee, tags, meetingId
     
     logger.info(`Task created: ${task._id} by user ${req.user.id}`);
     
-    res.status(201).json({
-      success: true,
-      data: task,
-      message: 'Task created successfully',
-    });
+    if (boardId) {
+      const populatedTask = await task.populate('assignee', 'name email image');
+      emitToBoard(boardId, 'task_created', { 
+        task: populatedTask, 
+        userName: req.user.name || 'Collaborator',
+        taskTitle: populatedTask.title,
+        userId: req.user.id
+      });
+    }
+
+    res.status(201).json({ success: true, data: task, message: 'Task created successfully' });
   } catch (error) {
     logger.error('Create task error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to create task',
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: 'Failed to create task', error: error.message });
   }
 };
 
@@ -126,46 +144,56 @@ const { title, description, status, priority, dueDate, assignee, tags, meetingId
  */
 const updateTask = async (req, res) => {
   try {
-    const { title, description, status, priority, dueDate, assignee, tags, order } = req.body;
+    const { title, description, status: rawStatus, priority, dueDate, assignee, labels, order } = req.body;
     
-    const task = await Task.findOne({
-      _id: req.params.id,
-      userId: req.user.id,
-    });
-    
-    if (!task) {
-      return res.status(404).json({
-        success: false,
-        message: 'Task not found',
-      });
+    // Verify access
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ success: false, message: 'Task not found' });
+
+    let hasAccess = task.userId.toString() === req.user.id;
+    if (!hasAccess && task.boardId) {
+      const board = await Board.findById(task.boardId);
+      if (board) {
+        const col = board.collaborators.find(c => c.user && c.user.toString() === req.user.id);
+        hasAccess = (board.userId.toString() === req.user.id) || (col && (col.role === 'editor' || col.role === 'owner'));
+      }
     }
-    
+
+    if (!hasAccess) return res.status(403).json({ success: false, message: 'Only owners and editors can update tasks' });
+
+    // Status normalization
+    const status = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
+
     // Update fields
     if (title !== undefined) task.title = title;
     if (description !== undefined) task.description = description;
     if (status !== undefined) task.status = status;
     if (priority !== undefined) task.priority = priority;
     if (dueDate !== undefined) task.dueDate = dueDate;
-    if (assignee !== undefined) task.assignee = assignee;
-    if (tags !== undefined) task.tags = tags;
+    if (assignee !== undefined) {
+      task.assignee = (assignee && mongoose.Types.ObjectId.isValid(assignee)) ? assignee : null;
+    }
+    if (labels !== undefined) task.labels = labels;
     if (order !== undefined) task.order = order;
     
     await task.save();
     
     logger.info(`Task updated: ${task._id}`);
+
+    if (task.boardId) {
+      const populatedTask = await Task.findById(task._id).populate('assignee', 'name email image');
+      emitToBoard(task.boardId, 'task_updated', { 
+        task: populatedTask, 
+        userName: req.user.name || 'Collaborator',
+        taskTitle: populatedTask.title,
+        userId: req.user.id
+      });
+    }
     
-    res.json({
-      success: true,
-      data: task,
-      message: 'Task updated successfully',
-    });
+    res.json({ success: true, data: task, message: 'Task updated successfully' });
   } catch (error) {
     logger.error('Update task error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to update task',
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: 'Failed to update task', error: error.message });
   }
 };
 
@@ -175,31 +203,41 @@ const updateTask = async (req, res) => {
  */
 const deleteTask = async (req, res) => {
   try {
-    const task = await Task.findOneAndDelete({
-      _id: req.params.id,
-      userId: req.user.id,
-    });
-    
-    if (!task) {
-      return res.status(404).json({
-        success: false,
-        message: 'Task not found',
-      });
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ success: false, message: 'Task not found' });
+
+    // Only owner can delete tasks? Or Owner + Editor? Let's say Owner only for high-stakes actions, or Owner + Editor for board tasks.
+    // User requested: "authorization access role yang belum jalan, contohnya delete task... masih bisa dilakukan oleh viewer only"
+    // So let's restrict to Owner/Editor.
+    let hasAccess = task.userId.toString() === req.user.id;
+    if (!hasAccess && task.boardId) {
+      const board = await Board.findById(task.boardId);
+      if (board) {
+        const col = board.collaborators.find(c => c.user && c.user.toString() === req.user.id);
+        hasAccess = (board.userId.toString() === req.user.id) || (col && (col.role === 'editor' || col.role === 'owner'));
+      }
     }
+
+    if (!hasAccess) return res.status(403).json({ success: false, message: 'Only owners and editors can delete tasks' });
+
+    const boardId = task.boardId;
+    await Task.findByIdAndDelete(req.params.id);
     
     logger.info(`Task deleted: ${req.params.id}`);
     
-    res.json({
-      success: true,
-      message: 'Task deleted successfully',
-    });
+    if (boardId) {
+      emitToBoard(boardId, 'task_deleted', { 
+        taskId: req.params.id, 
+        taskTitle: task.title,
+        userName: req.user.name || 'Collaborator',
+        userId: req.user.id
+      });
+    }
+
+    res.json({ success: true, message: 'Task deleted successfully' });
   } catch (error) {
     logger.error('Delete task error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to delete task',
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: 'Failed to delete task', error: error.message });
   }
 };
 
@@ -209,38 +247,47 @@ const deleteTask = async (req, res) => {
  */
 const reorderTasks = async (req, res) => {
   try {
-    const { tasks } = req.body;
+    const { tasks, boardId } = req.body;
     
     if (!tasks || !Array.isArray(tasks)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Tasks array is required',
-      });
+      return res.status(400).json({ success: false, message: 'Tasks array is required' });
+    }
+
+    if (boardId) {
+      const board = await Board.findById(boardId);
+      if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
+      
+      const isOwner = board.userId.toString() === req.user.id;
+      const col = board.collaborators.find(c => c.user && c.user.toString() === req.user.id);
+      const isEditor = col && (col.role === 'editor' || col.role === 'owner');
+
+      if (!isOwner && !isEditor) {
+        return res.status(403).json({ success: false, message: 'Only owners and editors can reorder tasks' });
+      }
     }
     
-    // Update all tasks in parallel
+    // Update all tasks with normalized status
     await Promise.all(
-      tasks.map(({ id, order, status }) =>
-        Task.findOneAndUpdate(
-          { _id: id, userId: req.user.id },
-          { order, status }
-        )
-      )
+      tasks.map(({ id, order, status: rawStatus }) => {
+        const status = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
+        return Task.findByIdAndUpdate(id, { order, status });
+      })
     );
     
     logger.info(`Tasks reordered by user ${req.user.id}`);
+
+    if (boardId) {
+      emitToBoard(boardId, 'tasks_reordered', { 
+        tasks, 
+        userName: req.user.name || 'Collaborator',
+        userId: req.user.id
+      });
+    }
     
-    res.json({
-      success: true,
-      message: 'Tasks reordered successfully',
-    });
+    res.json({ success: true, message: 'Tasks reordered successfully' });
   } catch (error) {
     logger.error('Reorder tasks error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to reorder tasks',
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: 'Failed to reorder tasks', error: error.message });
   }
 };
 
@@ -251,16 +298,28 @@ const reorderTasks = async (req, res) => {
 const getKanbanTasks = async (req, res) => {
   try {
     const { boardId } = req.query;
-    const filter = { userId: req.user.id };
-    if (boardId) filter.boardId = boardId;
+    if (!boardId) return res.status(400).json({ success: false, message: 'Board ID required' });
 
+    // Check board access
+    const board = await Board.findById(boardId);
+    if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
+
+    const isOwner = board.userId.toString() === req.user.id;
+    const isCollaborator = board.collaborators.some(c => c.user && c.user.toString() === req.user.id);
+
+    if (!isOwner && !isCollaborator) {
+      return res.status(403).json({ success: false, message: 'No access to this board' });
+    }
+
+    const filter = { boardId };
     const tasks = await Task.find(filter)
       .populate('meetingId', 'title')
+      .populate('assignee', 'name email image')
       .sort({ order: 1, createdAt: -1 });
     
     const kanban = {
       todo: tasks.filter(t => t.status === 'todo'),
-      'in-progress': tasks.filter(t => t.status === 'in-progress'),
+      'in-progress': tasks.filter(t => t.status === 'in_progress' || t.status === 'in-progress'),
       done: tasks.filter(t => t.status === 'done'),
     };
     

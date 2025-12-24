@@ -13,6 +13,11 @@ const {
   createOnlineMeeting,
   retryTranscription,
   getMeetingAnalytics,
+  generateShareLink,
+  joinMeeting,
+  revokeShareLink,
+  updateCollaboratorRole,
+  removeCollaborator,
 } = require('../controllers/meetingController');
 
 const router = express.Router();
@@ -81,5 +86,14 @@ router.get('/:id/export', asyncHandler(exportTranscript));
  * Get meeting analytics (talktime, topics/keywords)
  */
 router.get('/:id/analytics', optionalAuth, asyncHandler(getMeetingAnalytics));
+
+/**
+ * Collaboration & Sharing
+ */
+router.post('/:id/share', authenticate, asyncHandler(generateShareLink));
+router.post('/join/:token', authenticate, asyncHandler(joinMeeting));
+router.delete('/:id/share', authenticate, asyncHandler(revokeShareLink));
+router.patch('/:id/collaborators/:userId', authenticate, asyncHandler(updateCollaboratorRole));
+router.delete('/:id/collaborators/:userId', authenticate, asyncHandler(removeCollaborator));
 
 module.exports = router;

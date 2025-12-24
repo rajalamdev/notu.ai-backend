@@ -23,7 +23,7 @@ const taskSchema = new mongoose.Schema({
   title: {
     type: String,
     required: true,
-    trim: true,
+    yotrim: true,
   },
   description: {
     type: String,

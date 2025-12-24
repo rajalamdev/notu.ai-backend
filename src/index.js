@@ -106,11 +106,18 @@ async function startServer() {
 
     // Start Express server
     const PORT = config.PORT;
-    app.listen(PORT, () => {
+    const http = require('http');
+    const { initSocket } = require('./services/socketService');
+    
+    const server = http.createServer(app);
+    initSocket(server);
+
+    server.listen(PORT, () => {
       logger.info(`✓ Server running on port ${PORT}`);
       logger.info(`Environment: ${config.NODE_ENV}`);
       logger.info(`API: http://localhost:${PORT}/api`);
       logger.info(`Health: http://localhost:${PORT}/api/health`);
+      logger.info(`✓ Socket.io initialized`);
     });
 
   } catch (error) {

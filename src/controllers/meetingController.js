@@ -2,7 +2,9 @@ const Meeting = require('../models/Meeting');
 const Task = require('../models/Task');
 const { removeFile, getFileUrl } = require('../services/storageService');
 const { getJobStatus } = require('../services/queueService');
-const { MEETING_STATUS, MEETING_TYPE, PLATFORM } = require('../utils/constants');
+const crypto = require('crypto');
+const nanoid = (size = 10) => crypto.randomBytes(size).toString('hex').slice(0, size);
+const { MEETING_STATUS, MEETING_TYPE, PLATFORM, COLLABORATOR_ROLES } = require('../utils/constants');
 const config = require('../config/env');
 const axios = require('axios');
 const logger = require('../utils/logger');
@@ -22,12 +24,26 @@ async function getAllMeetings(req, res, next) {
     // Build query - filter by user if authenticated
     const query = {};
     if (req.user && req.user.id) {
-      query.userId = req.user.id;
+      const filter = req.query.filter || 'all';
+      
+      if (filter === 'mine') {
+        query.userId = req.user.id;
+      } else if (filter === 'shared') {
+        query['collaborators.user'] = req.user.id;
+        query.userId = { $ne: req.user.id }; // Ensure not owner
+      } else {
+        query.$or = [
+          { userId: req.user.id },
+          { 'collaborators.user': req.user.id }
+        ];
+      }
     }
+
     if (status) query.status = status;
     if (type) query.type = type;
     if (search) {
       query.$or = [
+        ...(query.$or || []),
         { title: { $regex: search, $options: 'i' } },
         { description: { $regex: search, $options: 'i' } },
         { tags: { $in: [new RegExp(search, 'i')] } },
@@ -66,7 +82,7 @@ async function getMeetingById(req, res, next) {
   try {
     const { id } = req.params;
 
-    const meeting = await Meeting.findById(id);
+    const meeting = await Meeting.findById(id).populate('collaborators.user', 'name email image');
 
     if (!meeting) {
       return res.status(404).json({
@@ -74,6 +90,27 @@ async function getMeetingById(req, res, next) {
         error: 'Not Found',
         message: 'Meeting not found',
       });
+    }
+
+    // Check access
+    const isOwner = meeting.userId && meeting.userId.toString() === req.user?.id;
+    const isCollaborator = meeting.collaborators.some(c => c.user && c.user._id.toString() === req.user?.id);
+    const isPublic = meeting.isPublic;
+
+    if (!isOwner && !isCollaborator && !isPublic) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'You do not have permission to access this meeting',
+      });
+    }
+
+    // Role for current user
+    let userRole = 'viewer';
+    if (isOwner) userRole = 'owner';
+    else if (isCollaborator) {
+      const col = meeting.collaborators.find(c => c.user._id.toString() === req.user?.id);
+      userRole = col.role;
     }
 
     // Get file URL if file exists
@@ -93,7 +130,10 @@ async function getMeetingById(req, res, next) {
 
     res.json({
       success: true,
-      meeting,
+      meeting: {
+        ...meeting.toObject(),
+        userRole
+      },
       actionItems, // Action items from Task collection
       fileUrl,
     });
@@ -505,6 +545,11 @@ module.exports = {
   createOnlineMeeting,
   retryTranscription,
   getMeetingAnalytics,
+  generateShareLink,
+  joinMeeting,
+  revokeShareLink,
+  updateCollaboratorRole,
+  removeCollaborator,
 };
 
 /**
@@ -676,6 +721,121 @@ async function retryTranscription(req, res, next) {
     });
   } catch (error) {
     logger.error('Error retrying transcription:', error);
+    next(error);
+  }
+}
+
+/**
+ * Sharing & Collaboration
+ */
+async function generateShareLink(req, res, next) {
+  try {
+    const { id } = req.params;
+    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    if (!meeting.shareToken) {
+      meeting.shareToken = nanoid(10);
+      await meeting.save();
+    }
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.json({
+      success: true,
+      data: {
+        shareToken: meeting.shareToken,
+        shareUrl: `${frontendUrl}/dashboard/join/meeting/${meeting.shareToken}`
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function joinMeeting(req, res, next) {
+  try {
+    const { token } = req.params;
+    const meeting = await Meeting.findOne({ shareToken: token });
+
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Invalid share link' });
+    }
+
+    // Check if user is already owner or collaborator
+    const isOwner = meeting.userId.toString() === req.user.id;
+    const isCollaborator = meeting.collaborators.some(c => c.user && c.user.toString() === req.user.id);
+
+    if (!isOwner && !isCollaborator) {
+      meeting.collaborators.push({
+        user: req.user.id,
+        role: COLLABORATOR_ROLES.VIEWER
+      });
+      await meeting.save();
+    }
+
+    res.json({
+      success: true,
+      message: 'Joined meeting successfully',
+      data: { meetingId: meeting._id }
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function revokeShareLink(req, res, next) {
+  try {
+    const { id } = req.params;
+    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    meeting.shareToken = undefined;
+    await meeting.save();
+
+    res.json({ success: true, message: 'Share link revoked' });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function updateCollaboratorRole(req, res, next) {
+  try {
+    const { id, userId } = req.params;
+    const { role } = req.body;
+
+    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+    if (!meeting) return res.status(404).json({ success: false, message: 'Meeting not found' });
+
+    const col = meeting.collaborators.find(c => c.user && c.user.toString() === userId);
+    if (!col) return res.status(404).json({ success: false, message: 'Collaborator not found' });
+
+    col.role = role;
+    await meeting.save();
+
+    res.json({ success: true, message: 'Role updated' });
+  } catch (error) {
+    next(error);
+  }
+}
+
+async function removeCollaborator(req, res, next) {
+  try {
+    const { id, userId } = req.params;
+    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+
+    if (!meeting) return res.status(404).json({ success: false, message: 'Meeting not found' });
+
+    meeting.collaborators = meeting.collaborators.filter(c => c.user && c.user.toString() !== userId);
+    await meeting.save();
+
+    res.json({ success: true, message: 'Collaborator removed' });
+  } catch (error) {
     next(error);
   }
 }

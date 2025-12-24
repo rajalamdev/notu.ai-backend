@@ -55,4 +55,10 @@ module.exports = {
     DIARIZATION_METHOD: 'multi',
     ENABLE_SUMMARY: true,
   },
+  // Collaborator roles
+  COLLABORATOR_ROLES: {
+    OWNER: 'owner',
+    EDITOR: 'editor',
+    VIEWER: 'viewer',
+  },
 };
