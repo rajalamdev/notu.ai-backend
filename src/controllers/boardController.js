@@ -8,6 +8,11 @@ const { COLLABORATOR_ROLES } = require('../utils/constants');
 exports.getBoards = async (req, res) => {
   try {
     const filter = req.query.filter || 'all';
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 12;
+    const skip = (page - 1) * limit;
+    const search = req.query.search;
+
     let query = {};
 
     if (filter === 'mine') {
@@ -22,11 +27,49 @@ exports.getBoards = async (req, res) => {
       ];
     }
 
+    if (search) {
+      const searchOr = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+      ];
+
+      if (query.$or && Array.isArray(query.$or) && query.$or.length) {
+        query.$and = [{ $or: query.$or }, { $or: searchOr }];
+        delete query.$or;
+      } else {
+        query.$or = searchOr;
+      }
+    }
+    // Source filter (ai/generated or manual)
+    if (req.query.source) {
+      // Accept either 'ai' or 'manual' (client may send 'generated' map to 'ai')
+      const src = req.query.source === 'generated' ? 'ai' : req.query.source
+      query.source = src
+    }
+    // If client asks for boards tied to a specific meeting, filter by meetingId
+    if (req.query.meetingId) {
+      query.meetingId = req.query.meetingId
+    }
+
     const boards = await Board.find(query)
       .populate('userId', 'name email image')
-      .sort({ createdAt: -1 });
-      
-    res.json({ success: true, count: boards.length, data: boards });
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit);
+
+    const total = await Board.countDocuments(query);
+
+    res.json({
+      success: true,
+      count: boards.length,
+      data: boards,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      }
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ success: false, message: 'Server Error' });
@@ -88,14 +131,24 @@ exports.createBoard = async (req, res) => {
 
 exports.createFromMeeting = async (req, res) => {
   try {
-    const { meetingId } = req.body;
-    if (!meetingId) {
+    // Accept either { meetingId: 'id' } or plain string in body
+    let meetingIdRaw = req.body && req.body.meetingId !== undefined ? req.body.meetingId : req.body
+    if (!meetingIdRaw) {
       return res.status(400).json({ success: false, message: 'Meeting ID required' });
     }
 
-    const meeting = await Meeting.findOne({ _id: meetingId, userId: req.user.id });
+    const meetingId = (typeof meetingIdRaw === 'object' && meetingIdRaw.meetingId) ? meetingIdRaw.meetingId : meetingIdRaw
+
+    // Allow owners or collaborators to create/migrate a board
+    const meeting = await Meeting.findOne({
+      _id: meetingId,
+      $or: [
+        { userId: req.user.id },
+        { 'collaborators.user': req.user.id }
+      ]
+    });
     if (!meeting) {
-      return res.status(404).json({ success: false, message: 'Meeting not found' });
+      return res.status(404).json({ success: false, message: 'Meeting not found or access denied' });
     }
 
     // Check if board already exists for this meeting

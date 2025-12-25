@@ -1,6 +1,6 @@
 const Meeting = require('../models/Meeting');
 const Task = require('../models/Task');
-const { retrieveFile, removeFile } = require('../services/storageService');
+const { retrieveFile, removeFile, copyToQuarantine } = require('../services/storageService');
 const { transcribeAudio } = require('../services/whisperxService');
 const { createTranscriptionWorker } = require('../services/queueService');
 const { MEETING_STATUS } = require('../utils/constants');
@@ -35,7 +35,13 @@ async function processTranscription(job) {
       };
     }
 
-    // Update status to processing
+    // Populate processingMeta and update status to processing
+    meeting.processingMeta = meeting.processingMeta || {};
+    meeting.processingMeta.jobId = job.id || `transcription-${meetingId}`;
+    meeting.processingMeta.queuedAt = meeting.processingMeta.queuedAt || new Date();
+    meeting.processingMeta.processingStartedAt = new Date();
+    meeting.processingMeta.lastUpdatedAt = new Date();
+    await meeting.save();
     await meeting.updateStatus(MEETING_STATUS.PROCESSING);
     await job.updateProgress(20);
 
@@ -87,6 +93,16 @@ async function processTranscription(job) {
       numSpeakers: transcriptionResult.metadata?.total_speakers || 0,
       processingTime: transcriptionResult.processingTime,
     };
+
+    // Save a short summary snippet for list previews
+    try {
+      const snippet = transcriptionResult.summary ? String(transcriptionResult.summary).slice(0, 200) : (transcriptionResult.transcript ? String(transcriptionResult.transcript).slice(0, 200) : '');
+      meeting.summarySnippet = snippet;
+      meeting.processingMeta = meeting.processingMeta || {};
+      meeting.processingMeta.lastUpdatedAt = new Date();
+    } catch (e) {
+      logger.warn('Could not set summarySnippet:', e);
+    }
 
     // Create tasks from action items (save to Task collection)
     if (transcriptionResult.action_items && Array.isArray(transcriptionResult.action_items) && transcriptionResult.action_items.length > 0) {
@@ -187,14 +203,18 @@ async function processTranscription(job) {
         // If max retries reached, mark as failed and cleanup MinIO
         if (meeting.retryCount >= 3) {
           await meeting.updateStatus(MEETING_STATUS.FAILED, error.message);
-          
-          // Cleanup file from MinIO to save storage
+
+          // Move file to quarantine instead of immediate deletion to preserve for debugging
           if (meeting.originalFile && meeting.originalFile.filename) {
             try {
-              await removeFile(meeting.originalFile.filename);
-              logger.info(`Cleaned up failed meeting file: ${meeting.originalFile.filename}`);
+              const qname = await copyToQuarantine(meeting.originalFile.filename);
+              logger.info(`Moved failed meeting file to quarantine: ${qname}`);
+              // Optionally update meeting record with quarantine path
+              meeting.processingMeta = meeting.processingMeta || {};
+              meeting.processingMeta.quarantinePath = qname;
+              await meeting.save();
             } catch (cleanupError) {
-              logger.error('Error cleaning up MinIO file:', cleanupError);
+              logger.error('Error moving file to quarantine:', cleanupError);
             }
           }
         }

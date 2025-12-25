@@ -96,6 +96,17 @@ const meetingSchema = new mongoose.Schema({
   // Error tracking
   errorMessage: String,
   retryCount: { type: Number, default: 0 },
+  // Lightweight processing metadata for job tracing and polling
+  processingMeta: {
+    jobId: String,
+    queuedAt: Date,
+    processingStartedAt: Date,
+    lastUpdatedAt: Date,
+  },
+  // Short summary/snippet used in list views to avoid loading full transcript
+  summarySnippet: { type: String, default: '' },
+  // Soft-delete flag
+  deleted: { type: Boolean, default: false },
   
 }, {
   timestamps: true, // Adds createdAt and updatedAt
@@ -106,6 +117,10 @@ meetingSchema.index({ userId: 1, createdAt: -1 });
 meetingSchema.index({ status: 1 });
 meetingSchema.index({ type: 1 });
 meetingSchema.index({ 'originalFile.filename': 1 });
+// Index collaborators.user for efficient shared queries
+meetingSchema.index({ 'collaborators.user': 1 });
+// Text index for searching title and description
+meetingSchema.index({ title: 'text', description: 'text' });
 
 // Virtual for meeting URL
 meetingSchema.virtual('url').get(function() {

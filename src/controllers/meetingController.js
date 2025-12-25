@@ -23,6 +23,8 @@ async function getAllMeetings(req, res, next) {
 
     // Build query - filter by user if authenticated
     const query = {};
+    // Exclude soft-deleted meetings by default (treat missing field as not deleted)
+    query.deleted = { $ne: true };
     if (req.user && req.user.id) {
       const filter = req.query.filter || 'all';
       
@@ -40,17 +42,32 @@ async function getAllMeetings(req, res, next) {
     }
 
     if (status) query.status = status;
-    if (type) query.type = type;
+    if (type) {
+      // support comma-separated list of types (e.g. "online,realtime")
+      if (typeof type === 'string' && type.includes(',')) {
+        const types = type.split(',').map(t => t.trim()).filter(Boolean);
+        if (types.length) query.type = { $in: types };
+      } else {
+        query.type = type;
+      }
+    }
     if (search) {
-      query.$or = [
-        ...(query.$or || []),
+      const searchOr = [
         { title: { $regex: search, $options: 'i' } },
         { description: { $regex: search, $options: 'i' } },
         { tags: { $in: [new RegExp(search, 'i')] } },
       ];
+
+      // If we already have an ownership $or (owner/shared), combine using $and
+      if (query.$or && Array.isArray(query.$or) && query.$or.length) {
+        query.$and = [{ $or: query.$or }, { $or: searchOr }];
+        delete query.$or;
+      } else {
+        query.$or = searchOr;
+      }
     }
 
-    // Get meetings
+    // Get meetings (list view should exclude large transcription segments)
     const meetings = await Meeting.find(query)
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -59,9 +76,37 @@ async function getAllMeetings(req, res, next) {
 
     const total = await Meeting.countDocuments(query);
 
+    // Map meetings to include lightweight derived fields for frontend
+    const mapped = meetings.map((m) => {
+      const obj = m.toObject();
+
+      const isOwner = req.user && obj.userId && obj.userId.toString() === req.user.id;
+      let isCollaborator = false;
+      if (req.user && obj.collaborators && Array.isArray(obj.collaborators)) {
+        isCollaborator = obj.collaborators.some(c => c.user && c.user.toString() === req.user.id);
+      }
+
+      let userRole = null;
+      if (isOwner) userRole = 'owner';
+      else if (isCollaborator) {
+        const col = obj.collaborators.find(c => c.user && c.user.toString() === req.user.id);
+        userRole = col ? col.role : 'viewer';
+      }
+
+      // Provide a lightweight summary for list previews
+      const summarySnippet = obj.summarySnippet || (obj.transcription && obj.transcription.summary ? String(obj.transcription.summary).slice(0, 200) : '');
+
+      return Object.assign({}, obj, {
+        isOwner,
+        isCollaborator,
+        userRole,
+        summarySnippet,
+      });
+    });
+
     res.json({
       success: true,
-      meetings,
+      meetings: mapped,
       pagination: {
         page,
         limit,
@@ -303,6 +348,19 @@ async function exportTranscript(req, res, next) {
         success: false,
         error: 'Not Found',
         message: 'Meeting not found',
+      });
+    }
+
+    // Access check: owner | collaborator | public
+    const isOwner = meeting.userId && meeting.userId.toString() === req.user?.id;
+    const isCollaborator = meeting.collaborators && meeting.collaborators.some(c => c.user && c.user.toString() === req.user?.id);
+    const isPublic = meeting.isPublic;
+
+    if (!isOwner && !isCollaborator && !isPublic) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'You do not have permission to export this meeting',
       });
     }
 

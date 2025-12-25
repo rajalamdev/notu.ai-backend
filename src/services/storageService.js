@@ -65,6 +65,34 @@ async function removeFile(filename) {
 }
 
 /**
+ * Copy a file to quarantine area and remove original.
+ * Returns the quarantine filename.
+ */
+async function copyToQuarantine(filename) {
+  try {
+    const stream = await downloadFile(filename);
+    const quarantineName = `quarantine/${generateUniqueFilename(filename)}`;
+    // Upload stream to quarantine
+    const result = await uploadFile(stream, quarantineName, {
+      'Content-Type': 'application/octet-stream',
+      'Original-Name': filename,
+    });
+    logger.info(`File copied to quarantine: ${quarantineName}`);
+    // Remove original file after successful copy
+    try {
+      await deleteFile(filename);
+      logger.info(`Original file deleted after quarantine: ${filename}`);
+    } catch (delErr) {
+      logger.warn(`Failed to delete original file after quarantine: ${filename}`, delErr);
+    }
+    return quarantineName;
+  } catch (error) {
+    logger.error('Error copying file to quarantine:', error);
+    throw new Error(`Failed to copy file to quarantine: ${error.message}`);
+  }
+}
+
+/**
  * Get public URL for file
  */
 async function getFileUrl(filename, expirySeconds = 3600) {
@@ -98,4 +126,5 @@ module.exports = {
   removeFile,
   getFileUrl,
   cleanupTempFile,
+  copyToQuarantine,
 };
