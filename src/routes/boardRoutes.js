@@ -4,7 +4,8 @@ const { authenticate } = require('../middleware/auth');
 const { 
   getBoards, 
   getBoard, 
-  createBoard, 
+  createBoard,
+  deleteBoard,
   createFromMeeting,
   updateBoard,
   generateShareLink,
@@ -21,6 +22,7 @@ router.post('/', createBoard);
 router.post('/from-meeting', createFromMeeting);
 router.get('/:id', getBoard);
 router.patch('/:id', updateBoard);
+router.delete('/:id', deleteBoard);
 
 // Sharing & Collaboration
 router.post('/:id/share', generateShareLink);

@@ -5,6 +5,21 @@ const { transcribeAudio } = require('../services/whisperxService');
 const { createTranscriptionWorker } = require('../services/queueService');
 const { MEETING_STATUS } = require('../utils/constants');
 const logger = require('../utils/logger');
+const { normalizeDate } = require('../utils/dateUtils');
+
+/**
+ * Helper to add a log message to the meeting
+ */
+async function addProcessingLog(meeting, message) {
+  try {
+    meeting.processingLogs = meeting.processingLogs || [];
+    meeting.processingLogs.push({ message, timestamp: new Date() });
+    await meeting.save();
+    logger.info(`[Meeting ${meeting._id}] LOG: ${message}`);
+  } catch (err) {
+    logger.error('Error adding processing log:', err);
+  }
+}
 
 /**
  * Process transcription job
@@ -24,6 +39,8 @@ async function processTranscription(job) {
     if (!meeting) {
       throw new Error(`Meeting not found: ${meetingId}`);
     }
+
+    await addProcessingLog(meeting, 'Memulai proses transkripsi...');
 
     // Check if already completed (prevent duplicate processing)
     if (meeting.status === MEETING_STATUS.COMPLETED) {
@@ -47,11 +64,13 @@ async function processTranscription(job) {
 
     // Get file from storage
     logger.info(`Retrieving file from storage: ${meeting.originalFile.filename}`);
+    await addProcessingLog(meeting, 'Mengunduh file audio dari storage...');
     const fileStream = await retrieveFile(meeting.originalFile.filename);
     await job.updateProgress(30);
 
     // Send to WhisperX API (removed unused diarizationMethod parameter)
     logger.info(`Sending to WhisperX API for transcription`);
+    await addProcessingLog(meeting, 'Mengirim audio ke AI service (WhisperX)...');
     const transcriptionResult = await transcribeAudio(
       fileStream,
       meeting.originalFile.originalName || meeting.originalFile.filename,
@@ -61,6 +80,7 @@ async function processTranscription(job) {
         enableSummary: true,
       }
     );
+    await addProcessingLog(meeting, 'Transkripsi & Diarization selesai. Menganalisis hasil...');
     await job.updateProgress(90);
 
     // Transform speakers array from ["SPEAKER_0"] to [{speaker, start, end}]
@@ -104,59 +124,59 @@ async function processTranscription(job) {
       logger.warn('Could not set summarySnippet:', e);
     }
 
-    // Create tasks from action items (save to Task collection)
-    if (transcriptionResult.action_items && Array.isArray(transcriptionResult.action_items) && transcriptionResult.action_items.length > 0) {
-      const tasksToCreate = transcriptionResult.action_items.map((item, index) => {
-        // Parse dueDate if it's a string
-        let parsedDueDate = undefined
-        if (item.dueDate) {
-          // Try to parse date strings like "Besok", "Minggu depan", or date formats
-          const dueDateStr = String(item.dueDate).toLowerCase()
-          const now = new Date()
-          
-          if (dueDateStr.includes('besok') || dueDateStr.includes('tomorrow')) {
-            parsedDueDate = new Date(now.getTime() + 24 * 60 * 60 * 1000)
-          } else if (dueDateStr.includes('minggu depan') || dueDateStr.includes('next week')) {
-            parsedDueDate = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
-          } else if (dueDateStr.includes('lusa')) {
-            parsedDueDate = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000)
-          } else {
-            // Try to parse as date
-            try {
-              parsedDueDate = new Date(item.dueDate)
-              if (isNaN(parsedDueDate.getTime())) {
-                parsedDueDate = undefined
-              }
-            } catch {
-              parsedDueDate = undefined
-            }
-          }
-        }
-        
-        return {
-          userId: meeting.userId, // Link to meeting owner
-          meetingId: meeting._id, // Reference to source meeting
-          source: 'ai', // Mark as AI-generated
-          title: item.title || item.text || 'Untitled Task',
-          description: item.description || '',
-          assignee: null, // Always null from AI, will be assigned via UI
-          assigneeName: item.assigneeName || '', // Store name if mentioned
-          priority: item.priority || 'medium',
-          dueDate: parsedDueDate,
-          status: 'todo', // Always start as todo
-          labels: item.labels || [],
-          order: index, // Preserve order from AI
-        }
-      })
-      
-      // Bulk insert tasks
-      try {
-        const createdTasks = await Task.insertMany(tasksToCreate)
-        logger.info(`Created ${createdTasks.length} tasks from AI extraction for meeting ${meetingId}`)
-      } catch (taskError) {
-        logger.error(`Failed to create tasks for meeting ${meetingId}:`, taskError)
-        // Don't throw - transcription still succeeded, just log the error
+    // Update title/description if suggested
+    if (transcriptionResult.suggestedTitle) {
+      meeting.suggestedTitle = transcriptionResult.suggestedTitle;
+      // If title is default (likely from filename), suggest one
+      const isPlaceholder = !meeting.title || 
+        meeting.title.includes('Meeting') || 
+        meeting.title.includes('Upload') || 
+        meeting.title.includes('video_') || 
+        meeting.title.includes('audio_') ||
+        (meeting.originalFile?.originalName && meeting.originalFile.originalName.toLowerCase().startsWith(meeting.title.toLowerCase()));
+
+      if (isPlaceholder) {
+        meeting.title = transcriptionResult.suggestedTitle;
       }
+    }
+
+    if (transcriptionResult.tags && Array.isArray(transcriptionResult.tags)) {
+      meeting.tags = transcriptionResult.tags;
+    }
+
+    if (transcriptionResult.suggestedDescription) {
+      meeting.description = transcriptionResult.suggestedDescription;
+    } else if (!meeting.description && transcriptionResult.summary && !transcriptionResult.summary.includes('tidak tersedia')) {
+      // Use first paragraph of summary as description
+      // Robust markdown stripping: remove bold, italic, headers, list markers
+      const firstPara = transcriptionResult.summary.split('\n').find(line => line.trim().length > 0) || '';
+      const cleanDesc = firstPara
+        .replace(/\*\*/g, '')   // Bold
+        .replace(/__/g, '')     // Bold
+        .replace(/\*/g, '')     // Italic/List
+        .replace(/^#+\s/, '')   // Headers
+        .trim();
+      
+      meeting.description = cleanDesc.slice(0, 500);
+    }
+
+    // Process Action Items (Save as Candidates)
+    if (transcriptionResult.action_items && Array.isArray(transcriptionResult.action_items)) {
+      meeting.actionItems = transcriptionResult.action_items.map(item => {
+         // Normalize due date using a central helper. Keep raw value for auditing.
+         const norm = normalizeDate(item.dueDate);
+
+         return {
+           title: item.title || item.text || 'Untitled Task',
+           description: item.description || '',
+           priority: item.priority || 'medium',
+           dueDate: norm.date || null,
+           dueDateRaw: norm.raw || null,
+           assigneeName: item.assigneeName,
+           labels: item.labels,
+           status: 'todo'
+         };
+      });
     }
 
     // Calculate participants count from speakers
@@ -176,9 +196,11 @@ async function processTranscription(job) {
     }
 
     // Save all transcription data to MongoDB
+    await addProcessingLog(meeting, 'Menyimpan hasil ke database...');
     await meeting.save();
 
     // Update status to completed
+    await addProcessingLog(meeting, 'Selesai! Semua data berhasil diproses.');
     await meeting.updateStatus(MEETING_STATUS.COMPLETED);
     await job.updateProgress(100);
 
@@ -198,10 +220,12 @@ async function processTranscription(job) {
     try {
       const meeting = await Meeting.findById(meetingId);
       if (meeting) {
+        await addProcessingLog(meeting, `Error: ${error.message}`);
         await meeting.incrementRetry();
         
         // If max retries reached, mark as failed and cleanup MinIO
         if (meeting.retryCount >= 3) {
+          await addProcessingLog(meeting, 'Gagal memproses setelah beberapa percobaan.');
           await meeting.updateStatus(MEETING_STATUS.FAILED, error.message);
 
           // Move file to quarantine instead of immediate deletion to preserve for debugging

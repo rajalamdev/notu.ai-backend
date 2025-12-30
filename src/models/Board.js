@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const { collaboratorSchema, labelSchema } = require('../utils/schemas');
 
 const boardSchema = new mongoose.Schema({
   userId: {
@@ -25,33 +26,10 @@ const boardSchema = new mongoose.Schema({
     default: 'manual',
   },
   shareToken: { type: String, unique: true, sparse: true },
-  collaborators: [{
-    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    role: { 
-      type: String, 
-      enum: ['owner', 'editor', 'viewer'], 
-      default: 'viewer' 
-    },
-    joinedAt: { type: Date, default: Date.now }
-  }],
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
-  updatedAt: {
-    type: Date,
-    default: Date.now,
-  },
-  labels: [{
-    name: { type: String, required: true },
-    color: { type: String, default: '#4f46e5' }
-  }]
-});
-
-// Update timestamp on save
-boardSchema.pre('save', function(next) {
-  this.updatedAt = Date.now();
-  next();
+  collaborators: [collaboratorSchema],
+  labels: [labelSchema]
+}, {
+  timestamps: true,
 });
 
 const Board = mongoose.models.Board || mongoose.model('Board', boardSchema);

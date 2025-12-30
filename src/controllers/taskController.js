@@ -94,8 +94,8 @@ const createTask = async (req, res) => {
       }
     }
 
-    // Fix status mapping
-    const status = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
+    // Status is already in correct format (in-progress)
+    const status = rawStatus;
     
     // Get max order
     const query = { status: status || 'todo' };
@@ -161,8 +161,8 @@ const updateTask = async (req, res) => {
 
     if (!hasAccess) return res.status(403).json({ success: false, message: 'Only owners and editors can update tasks' });
 
-    // Status normalization
-    const status = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
+    // Status is already in correct format (in-progress)
+    const status = rawStatus;
 
     // Update fields
     if (title !== undefined) task.title = title;
@@ -266,10 +266,9 @@ const reorderTasks = async (req, res) => {
       }
     }
     
-    // Update all tasks with normalized status
+    // Update all tasks - status format is already standardized
     await Promise.all(
-      tasks.map(({ id, order, status: rawStatus }) => {
-        const status = rawStatus === 'in-progress' ? 'in_progress' : rawStatus;
+      tasks.map(({ id, order, status }) => {
         return Task.findByIdAndUpdate(id, { order, status });
       })
     );
@@ -319,7 +318,7 @@ const getKanbanTasks = async (req, res) => {
     
     const kanban = {
       todo: tasks.filter(t => t.status === 'todo'),
-      'in-progress': tasks.filter(t => t.status === 'in_progress' || t.status === 'in-progress'),
+      'in-progress': tasks.filter(t => t.status === 'in-progress'),
       done: tasks.filter(t => t.status === 'done'),
     };
     

@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const { MEETING_STATUS, MEETING_TYPE, PLATFORM } = require('../utils/constants');
+const { collaboratorSchema } = require('../utils/schemas');
 
 const segmentSchema = new mongoose.Schema({
   start: { type: Number, required: true },
@@ -76,21 +77,26 @@ const meetingSchema = new mongoose.Schema({
   // Transcription data
   transcription: transcriptionSchema,
   
-  // Note: Action items are now stored in Task collection with meetingId reference
-  // Use Task.find({ meetingId: meeting._id }) to get action items
+  // AI Generated Candidates (Human-in-the-loop workflow)
+  // These are not yet real Tasks. User must approve them.
+  actionItems: [{
+    title: String,
+    description: String,
+    priority: { type: String, enum: ['low', 'medium', 'high', 'urgent'], default: 'medium' },
+    dueDate: Date,
+    dueDateRaw: String,
+    assigneeName: String,
+    labels: [String],
+    status: { type: String, default: 'todo' } 
+  }],
+
+  suggestedTitle: String,
+
   
   // Sharing & collaboration
   isPublic: { type: Boolean, default: false },
   shareToken: { type: String, unique: true, sparse: true },
-  collaborators: [{
-    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    role: { 
-      type: String, 
-      enum: ['owner', 'editor', 'viewer'], 
-      default: 'viewer' 
-    },
-    joinedAt: { type: Date, default: Date.now }
-  }],
+  collaborators: [collaboratorSchema],
   tags: [String],
   
   // Error tracking
@@ -103,6 +109,10 @@ const meetingSchema = new mongoose.Schema({
     processingStartedAt: Date,
     lastUpdatedAt: Date,
   },
+  processingLogs: [{
+    message: String,
+    timestamp: { type: Date, default: Date.now }
+  }],
   // Short summary/snippet used in list views to avoid loading full transcript
   summarySnippet: { type: String, default: '' },
   // Soft-delete flag

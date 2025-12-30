@@ -1,5 +1,7 @@
+const mongoose = require('mongoose');
 const Meeting = require('../models/Meeting');
 const Task = require('../models/Task');
+const Board = require('../models/Board');
 const { removeFile, getFileUrl } = require('../services/storageService');
 const { getJobStatus } = require('../services/queueService');
 const crypto = require('crypto');
@@ -8,6 +10,94 @@ const { MEETING_STATUS, MEETING_TYPE, PLATFORM, COLLABORATOR_ROLES } = require('
 const config = require('../config/env');
 const axios = require('axios');
 const logger = require('../utils/logger');
+const { normalizeDate, extractDateFromText } = require('../utils/dateUtils');
+const { idEquals } = require('../utils/idEquals');
+const User = require('../models/User');
+
+/**
+ * Helper to add a log message to the meeting
+ */
+async function addProcessingLog(meeting, message) {
+  try {
+    meeting.processingLogs = meeting.processingLogs || [];
+    meeting.processingLogs.push({ message, timestamp: new Date() });
+    await meeting.save();
+    logger.info(`[Meeting ${meeting._id}] LOG: ${message}`);
+  } catch (err) {
+    logger.error('Error adding processing log:', err);
+  }
+}
+
+/**
+ * Helper to calculate meeting analytics
+ */
+function calculateAnalytics(meeting) {
+  if (!meeting || !meeting.transcription || !meeting.transcription.segments || meeting.transcription.segments.length === 0) {
+    return {
+      talkTime: [],
+      topics: [],
+    };
+  }
+
+  const talkTimeMap = {};
+  const segments = meeting.transcription.segments;
+  
+  segments.forEach((segment) => {
+    const speaker = segment.speaker || 'SPEAKER_0';
+    if (!talkTimeMap[speaker]) {
+      talkTimeMap[speaker] = {
+        speaker,
+        words: 0,
+        talks: 0,
+        totalDuration: 0,
+      };
+    }
+    const wordCount = segment.text ? segment.text.trim().split(/\s+/).filter(w => w.length > 0).length : 0;
+    talkTimeMap[speaker].words += wordCount;
+    talkTimeMap[speaker].talks += 1;
+    talkTimeMap[speaker].totalDuration += (segment.end - segment.start);
+  });
+
+  const totalTalkDuration = Object.values(talkTimeMap).reduce((sum, item) => sum + item.totalDuration, 0);
+  
+  const talkTime = Object.values(talkTimeMap)
+    .map((item) => ({
+      speaker: item.speaker,
+      words: item.words,
+      talks: item.talks,
+      total: totalTalkDuration > 0 ? Math.round((item.totalDuration / totalTalkDuration) * 100) : 0,
+    }))
+    .sort((a, b) => b.total - a.total);
+
+  const topics = [];
+  if (meeting.tags && meeting.tags.length > 0) {
+    meeting.tags.forEach((tag, index) => {
+      const colors = ['bg-purple-500', 'bg-emerald-500', 'bg-indigo-500', 'bg-rose-500', 'bg-amber-500'];
+      topics.push({
+        name: tag,
+        color: colors[index % colors.length],
+      });
+    });
+  } else if (meeting.transcription && meeting.transcription.summary) {
+    // Fallback: extract some keywords from summary if tags are missing (for old data)
+    const keywords = meeting.transcription.summary
+      .toLowerCase()
+      .replace(/[^\w\s]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 5 && !['adalah', 'dengan', 'bahwa', 'selanjutnya'].includes(w))
+      .slice(0, 5);
+    
+    keywords.forEach((tag, index) => {
+      const colors = ['bg-purple-500', 'bg-emerald-500', 'bg-indigo-500', 'bg-rose-500', 'bg-amber-500'];
+      topics.push({
+        name: tag.charAt(0).toUpperCase() + tag.slice(1),
+        color: colors[index % colors.length],
+      });
+    });
+  }
+
+  return { talkTime, topics };
+}
 
 /**
  * Get all meetings with pagination
@@ -67,41 +157,72 @@ async function getAllMeetings(req, res, next) {
       }
     }
 
-    // Get meetings (list view should exclude large transcription segments)
+    // Get meetings (list view: include only small, necessary fields)
     const meetings = await Meeting.find(query)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .select('-transcription.segments'); // Exclude segments for list view
+      .select('title suggestedTitle type transcription.summary description tags createdAt updatedAt userId isPublic collaborators'); // small projection for list view (include type)
 
     const total = await Meeting.countDocuments(query);
+
+    // Gather action item counts and board existence for the current page of meetings
+    const meetingIds = meetings.map(m => m._id);
+
+    const actionAgg = await Task.aggregate([
+      { $match: { meetingId: { $in: meetingIds } } },
+      { $group: { _id: '$meetingId', count: { $sum: 1 } } }
+    ]);
+    const actionMap = actionAgg.reduce((acc, cur) => (acc.set(String(cur._id), cur.count), acc), new Map());
+
+    const boardAgg = await Board.aggregate([
+      { $match: { meetingId: { $in: meetingIds } } },
+      { $group: { _id: '$meetingId', count: { $sum: 1 } } }
+    ]);
+    const boardMap = boardAgg.reduce((acc, cur) => (acc.set(String(cur._id), cur.count), acc), new Map());
 
     // Map meetings to include lightweight derived fields for frontend
     const mapped = meetings.map((m) => {
       const obj = m.toObject();
 
-      const isOwner = req.user && obj.userId && obj.userId.toString() === req.user.id;
-      let isCollaborator = false;
-      if (req.user && obj.collaborators && Array.isArray(obj.collaborators)) {
-        isCollaborator = obj.collaborators.some(c => c.user && c.user.toString() === req.user.id);
-      }
+      // Canonicalize title: prefer explicit title, fall back to suggestedTitle
+      const title = obj.title || obj.suggestedTitle || 'Untitled Meeting';
 
-      let userRole = null;
+      const currentUserId = req.user?.id || req.user?._id;
+      // Consider user owner if either they are the document owner or they are a collaborator with role 'owner'
+      const isCollaborator = req.user && obj.collaborators && Array.isArray(obj.collaborators) && obj.collaborators.some(c => c && c.user && idEquals(c.user, currentUserId));
+      const hasOwnerRole = req.user && obj.collaborators && Array.isArray(obj.collaborators) && obj.collaborators.some(c => c && c.user && c.role === COLLABORATOR_ROLES.OWNER && idEquals(c.user, currentUserId));
+      const isOwner = !!(req.user && (idEquals(obj.userId, currentUserId) || hasOwnerRole));
+
+      let userRole = 'viewer';
       if (isOwner) userRole = 'owner';
       else if (isCollaborator) {
-        const col = obj.collaborators.find(c => c.user && c.user.toString() === req.user.id);
+        const col = obj.collaborators.find(c => c && c.user && idEquals(c.user, currentUserId));
         userRole = col ? col.role : 'viewer';
       }
 
-      // Provide a lightweight summary for list previews
-      const summarySnippet = obj.summarySnippet || (obj.transcription && obj.transcription.summary ? String(obj.transcription.summary).slice(0, 200) : '');
+      // Provide a lightweight summary for list previews (use transcription.summary only)
+      const summarySnippet = obj.transcription && obj.transcription.summary ? String(obj.transcription.summary).slice(0, 200) : '';
 
-      return Object.assign({}, obj, {
+      const actionCount = actionMap.get(String(obj._id)) || 0;
+      const hasBoard = (boardMap.get(String(obj._id)) || 0) > 0;
+
+      return {
+        _id: obj._id,
+        title,
+        type: obj.type || 'upload',
+        description: obj.description || '',
+        tags: obj.tags || [],
+        createdAt: obj.createdAt,
+        updatedAt: obj.updatedAt,
+        userId: obj.userId,
+        isPublic: obj.isPublic || false,
         isOwner,
         isCollaborator,
         userRole,
-        summarySnippet,
-      });
+        actionItemCount: actionCount,
+        hasBoard,
+      };
     });
 
     res.json({
@@ -127,7 +248,9 @@ async function getMeetingById(req, res, next) {
   try {
     const { id } = req.params;
 
-    const meeting = await Meeting.findById(id).populate('collaborators.user', 'name email image');
+    // Fetch meeting without populating collaborators first so we can perform
+    // access checks against raw ObjectId values (populate may replace ids with null)
+    const meeting = await Meeting.findById(id);
 
     if (!meeting) {
       return res.status(404).json({
@@ -137,12 +260,28 @@ async function getMeetingById(req, res, next) {
       });
     }
 
-    // Check access
-    const isOwner = meeting.userId && meeting.userId.toString() === req.user?.id;
-    const isCollaborator = meeting.collaborators.some(c => c.user && c.user._id.toString() === req.user?.id);
-    const isPublic = meeting.isPublic;
+    // Backup raw userId for permission checks and fallback
+    const rawUserId = meeting.userId ? String(meeting.userId) : null;
+    // Backup raw collaborators (ids + role) before populate in case populate returns null
+    const rawCollaborators = Array.isArray(meeting.collaborators)
+      ? meeting.collaborators.map(c => ({ user: c.user, role: c.role, joinedAt: c.joinedAt }))
+      : [];
+
+    // Check access using idEquals to handle populated docs and raw ObjectIds
+    const currentUserId = req.user?.id || req.user?._id;
+    const isPublic = meeting.isPublic === true;
+
+    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
+    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
+
+    // Resolve collaborators from raw values in the document (these may be ObjectIds or populated docs)
+    const isCollaborator = meeting.collaborators && meeting.collaborators.some(c => {
+      if (!c || !c.user) return false;
+      return !!(currentUserId && idEquals(c.user, currentUserId));
+    });
 
     if (!isOwner && !isCollaborator && !isPublic) {
+      logger.warn(`Access denied for user ${currentUserId} to meeting ${id}. Owner: ${rawUserId}, Public: ${isPublic}`);
       return res.status(403).json({
         success: false,
         error: 'Forbidden',
@@ -154,9 +293,16 @@ async function getMeetingById(req, res, next) {
     let userRole = 'viewer';
     if (isOwner) userRole = 'owner';
     else if (isCollaborator) {
-      const col = meeting.collaborators.find(c => c.user._id.toString() === req.user?.id);
-      userRole = col.role;
+      const col = meeting.collaborators.find(c => {
+        if (!c || !c.user) return false;
+        return currentUserId && idEquals(c.user, currentUserId);
+      });
+      userRole = col?.role || 'viewer';
     }
+
+    // Populate userId and collaborators for response (after access checks)
+    await meeting.populate('userId', 'name email image');
+    await meeting.populate('collaborators.user', 'name email image');
 
     // Get file URL if file exists
     let fileUrl = null;
@@ -168,22 +314,140 @@ async function getMeetingById(req, res, next) {
       }
     }
 
-    // Get action items from Task collection
-    const actionItems = await Task.find({ meetingId: id })
-      .sort({ order: 1, createdAt: 1 })
+    // Unified Action Items logic
+    const tasks = await Task.find({ meetingId: id })
+      .sort({ order: 1, createdAt: -1 })
       .populate('assignee', 'name email');
+
+    // Check if a Kanban board exists for this meeting (may be created but tasks not migrated)
+    let board = await Board.findOne({ meetingId: id }).select('_id userId');
+    const hasBoard = !!board;
+
+    // Calculate analytics on the fly
+    const analytics = calculateAnalytics(meeting);
+
+    // Prune redundant data for response
+    const meetingObj = meeting.toObject();
+    
+    // 1. Remove summarySnippet (redundant with full summary on detail page)
+    delete meetingObj.summarySnippet;
+    
+    // 2. Clear logs if completed (keep response clean unless requested)
+    if (meeting.status === MEETING_STATUS.COMPLETED && !req.query.includeLogs) {
+      delete meetingObj.processingLogs;
+    }
+
+    // 3. Simplify originalFile
+    if (meetingObj.originalFile) {
+        delete meetingObj.originalFile.path;
+    }
+
+    // 4. Fallback for userId if populate failed or user was null
+    if (!meetingObj.userId && rawUserId) {
+        const isSelf = currentUserId === rawUserId;
+        meetingObj.userId = { 
+          _id: rawUserId, 
+          name: isSelf ? (req.user?.name || 'Anda') : 'Original Owner',
+          image: isSelf ? req.user?.image : null
+        };
+    }
+
+    // Ensure collaborators array is safe for the frontend. Use raw collaborator ids as fallback
+    const populatedCollabs = Array.isArray(meeting.collaborators) ? meeting.collaborators : [];
+    let finalCollaborators = (rawCollaborators || []).map((raw) => {
+      // Try to find the populated user matching this raw id
+      const populatedEntry = populatedCollabs.find(pc => pc && pc.user && idEquals(pc.user, raw.user));
+      const userObj = populatedEntry && populatedEntry.user
+        ? { _id: populatedEntry.user._id ? String(populatedEntry.user._id) : String(populatedEntry.user), name: populatedEntry.user.name || 'Unknown', image: populatedEntry.user.image || null }
+        : { _id: raw.user ? String(raw.user) : null, name: 'Unknown', image: null };
+
+      return {
+        user: userObj,
+        role: raw.role || COLLABORATOR_ROLES.VIEWER,
+        joinedAt: raw.joinedAt || null,
+      };
+    });
+
+    // Fill missing names/images by querying User collection once for any collaborator lacking details
+    try {
+      const needsFill = finalCollaborators.filter(c => c.user && (!c.user.name || c.user.name === 'Unknown' || c.user.image === null));
+      const idsToFill = [...new Set(needsFill.map(c => c.user._id).filter(Boolean))];
+      if (idsToFill.length) {
+        const users = await User.find({ _id: { $in: idsToFill } }).select('name image').lean();
+        const userMap = new Map(users.map(u => [String(u._id), u]));
+        finalCollaborators = finalCollaborators.map(col => {
+          const uid = String(col.user._id);
+          const u = userMap.get(uid);
+          if (u) {
+            return {
+              ...col,
+              user: {
+                _id: uid,
+                name: u.name || col.user.name || 'Unknown',
+                image: u.image || col.user.image || null,
+              }
+            };
+          }
+          return col;
+        });
+      }
+    } catch (e) {
+      logger.warn('Failed to backfill collaborator user info:', e?.message || e);
+    }
+
+    meetingObj.collaborators = finalCollaborators;
+
+    // 4. Overwrite/Harmonize Meta-data
+    // Move suggested values into main fields if missing (already Done in worker/controller but just in case)
+    // AND REMOVE suggestedTitle/suggestedDescription to avoid duplication in JSON response
+    delete meetingObj.suggestedTitle;
+    delete meetingObj.suggestedDescription;
+    // Remove the candidate list from the meeting object itself in response to avoid confusion
+    const aiCandidates = meetingObj.actionItems || [];
+    delete meetingObj.actionItems;
+
+    // Harmonize: Prioritize Real Tasks > AI Candidates
+    // NOTE: hasSyncedTasks should indicate that tasks are migrated (tasks.length > 0).
+    const hasSyncedTasks = tasks.length > 0;
+    let unifiedActionItems = hasSyncedTasks ? tasks : aiCandidates;
+
+    // If board exists but tasks are not yet migrated, attach boardId (string) to AI candidates
+    if (hasBoard && (!tasks || tasks.length === 0) && Array.isArray(unifiedActionItems) && unifiedActionItems.length) {
+      const boardIdStr = board && board._id ? String(board._id) : null;
+      unifiedActionItems = unifiedActionItems.map(item => ({ ...item, boardId: boardIdStr }));
+    }
 
     res.json({
       success: true,
       meeting: {
-        ...meeting.toObject(),
-        userRole
+        ...meetingObj,
+        boardId: board?._id ? String(board._id) : undefined,
+        hasBoard,
+        userRole,
+        fileUrl,
       },
-      actionItems, // Action items from Task collection
-      fileUrl,
+      analytics,
+      actionItems: unifiedActionItems,
+      hasSyncedTasks,
     });
   } catch (error) {
     logger.error('Error getting meeting:', error);
+    next(error);
+  }
+}
+
+/**
+ * Get meeting analytics (Legacy endpoint - kept for compatibility)
+ */
+async function getMeetingAnalytics(req, res, next) {
+  try {
+    const { id } = req.params;
+    const meeting = await Meeting.findById(id);
+    if (!meeting) return res.status(404).json({ success: false, message: 'Meeting not found' });
+    
+    const analytics = calculateAnalytics(meeting);
+    res.json({ success: true, data: analytics });
+  } catch (error) {
     next(error);
   }
 }
@@ -195,7 +459,7 @@ async function getMeetingStatus(req, res, next) {
   try {
     const { id } = req.params;
 
-    const meeting = await Meeting.findById(id).select('status errorMessage retryCount');
+    const meeting = await Meeting.findById(id).select('status errorMessage retryCount processingLogs');
 
     if (!meeting) {
       return res.status(404).json({
@@ -244,6 +508,20 @@ async function updateMeeting(req, res, next) {
       });
     }
 
+    // Access check: Only owner or editor can update
+    const currentUserId = req.user?.id || req.user?._id;
+    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
+    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
+    const isEditor = meeting.collaborators && meeting.collaborators.some(c => c && c.role === 'editor' && currentUserId && idEquals(c.user, currentUserId));
+
+    if (!isOwner && !isEditor) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'You do not have permission to update this meeting',
+      });
+    }
+
     // Only allow updating certain fields
     const allowedUpdates = ['title', 'description', 'tags', 'isPublic'];
     const updateData = {};
@@ -271,6 +549,10 @@ async function updateMeeting(req, res, next) {
       }
       
       updateData.transcription = meeting.transcription;
+    }
+
+    if (updates.tags !== undefined) {
+      updateData.tags = updates.tags;
     }
     
     // Note: actionItems are now managed via Task collection
@@ -310,6 +592,17 @@ async function deleteMeeting(req, res, next) {
       });
     }
 
+    // Access check: Only owner can delete
+    const currentUserId = req.user?.id?.toString() || req.user?._id?.toString();
+    const meetingOwnerId = meeting.userId?._id?.toString() || meeting.userId?.toString();
+    if (!currentUserId || meetingOwnerId !== currentUserId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'Only the meeting owner can delete it',
+      });
+    }
+
     // Delete file from MinIO if exists
     if (meeting.originalFile && meeting.originalFile.filename) {
       try {
@@ -319,6 +612,24 @@ async function deleteMeeting(req, res, next) {
         logger.warn(`Could not delete file: ${meeting.originalFile.filename}`, error);
       }
     }
+
+    // Delete associated boards and tasks
+    const meetingObjectId = new mongoose.Types.ObjectId(id);
+
+    const boards = await Board.find({ meetingId: meetingObjectId });
+    logger.info(`Cleaning up ${boards.length} boards for meeting ${id}`);
+    
+    for (const board of boards) {
+      await Task.deleteMany({ boardId: board._id });
+      logger.info(`Deleted tasks for board ${board._id}`);
+    }
+    
+    const boardDelResult = await Board.deleteMany({ meetingId: meetingObjectId });
+    logger.info(`Deleted ${boardDelResult.deletedCount} boards`);
+    
+    // Also delete any orphan tasks tied to meeting but no board (or redundant check)
+    const taskDelResult = await Task.deleteMany({ meetingId: meetingObjectId });
+    logger.info(`Deleted ${taskDelResult.deletedCount} tasks for meeting ${id}`);
 
     // Delete meeting from database
     await Meeting.findByIdAndDelete(id);
@@ -352,9 +663,12 @@ async function exportTranscript(req, res, next) {
     }
 
     // Access check: owner | collaborator | public
-    const isOwner = meeting.userId && meeting.userId.toString() === req.user?.id;
-    const isCollaborator = meeting.collaborators && meeting.collaborators.some(c => c.user && c.user.toString() === req.user?.id);
-    const isPublic = meeting.isPublic;
+    const currentUserId = req.user?.id || req.user?._id;
+    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
+    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
+    const isCollaborator = meeting.collaborators && meeting.collaborators.some(c => c && currentUserId && idEquals(c.user, currentUserId));
+    
+    const isPublic = meeting.isPublic === true;
 
     if (!isOwner && !isCollaborator && !isPublic) {
       return res.status(403).json({
@@ -469,125 +783,252 @@ async function exportTranscript(req, res, next) {
   }
 }
 
+
 /**
- * Get meeting analytics (talktime, topics/keywords)
- * GET /api/meetings/:id/analytics
+ * Regenerate AI metadata (summary, action items, etc) from existing transcript
  */
-async function getMeetingAnalytics(req, res, next) {
+async function regenerateMetadata(req, res, next) {
+  let meeting;
   try {
     const { id } = req.params;
-
-    const meeting = await Meeting.findById(id);
+    meeting = await Meeting.findById(id);
 
     if (!meeting) {
-      return res.status(404).json({
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    // Access check: owner or editor
+    const currentUserId = req.user?.id || req.user?._id;
+    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
+    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
+    const isEditor = meeting.collaborators && meeting.collaborators.some(c => c && c.role === 'editor' && currentUserId && idEquals(c.user, currentUserId));
+
+    if (!isOwner && !isEditor) {
+      return res.status(403).json({
         success: false,
-        error: 'Not Found',
-        message: 'Meeting not found',
+        message: 'You do not have permission to regenerate metadata for this meeting',
+      });
+    }
+
+    if (!meeting.transcription || !meeting.transcription.transcript) {
+      return res.status(400).json({ success: false, message: 'No transcript available to regenerate from' });
+    }
+
+    await addProcessingLog(meeting, 'Mengulangi analisis AI pada transkrip...');
+    
+    // Sync logic: Delete existing Kanban board if it exists for this meeting
+    // We do this BEFORE regeneration so the user can start fresh
+    const meetingObjectId = new mongoose.Types.ObjectId(id);
+
+    const boardCount = await Board.countDocuments({ meetingId: meetingObjectId });
+    if (boardCount > 0) {
+      // Delete all tasks associated with this meeting
+      await Task.deleteMany({ meetingId: meetingObjectId });
+      // Delete all boards associated with this meeting
+      await Board.deleteMany({ meetingId: meetingObjectId });
+      
+      await addProcessingLog(meeting, `Semua ${boardCount} board Kanban dan tugas lama dihapus untuk sinkronisasi ulang.`);
+    } else {
+      // Still clear tasks just in case there are orphan ones
+      await Task.deleteMany({ meetingId: meetingObjectId });
+    }
+
+    const { analyzeTranscript } = require('../services/whisperxService');
+    const result = await analyzeTranscript(meeting.transcription.transcript);
+    // Persist a one-time raw snapshot of the analyze result for debugging/audit
+    try {
+      await addProcessingLog(meeting, `Raw analyze result snapshot: ${JSON.stringify(result).slice(0,2000)}`);
+    } catch (e) {
+      logger.debug('Failed to persist raw analyze snapshot', e.message);
+    }
+    // Log diagnostics from LLM and the action_items payload to aid debugging
+    try {
+      if (result.__llm_diagnostics) logger.debug('LLM diagnostics:', result.__llm_diagnostics);
+      const aiPayload = result.actionItems || result.action_items || [];
+      logger.debug('Regenerate analyze result action_items sample:', JSON.stringify((Array.isArray(aiPayload) ? aiPayload.slice(0,5) : aiPayload)));
+    } catch (e) {
+      // ignore logging errors
+    }
+
+    // Update transcription fields
+    meeting.transcription.summary = result.summary || meeting.transcription.summary;
+    meeting.transcription.highlights = result.highlights || meeting.transcription.highlights;
+    meeting.transcription.conclusion = result.conclusion || meeting.transcription.conclusion;
+    
+    if (result.suggestedDescription) {
+      meeting.description = result.suggestedDescription;
+    }
+    
+    // Update tags if available
+    if (result.tags && Array.isArray(result.tags)) {
+      meeting.tags = result.tags;
+    }
+    
+    if (result.suggestedTitle) {
+      meeting.suggestedTitle = result.suggestedTitle;
+      // Always apply to main title if it looks like a placeholder
+      const isPlaceholder = !meeting.title || 
+        meeting.title.includes('Meeting') || 
+        meeting.title.includes('Upload') || 
+        meeting.title.includes('video_') || 
+        meeting.title.includes('audio_') ||
+        (meeting.originalFile?.originalName && meeting.originalFile.originalName.toLowerCase().startsWith(meeting.title.toLowerCase()));
+      
+      if (isPlaceholder) {
+        meeting.title = result.suggestedTitle;
+      }
+    }
+
+    if (result.suggestedDescription) {
+      meeting.description = result.suggestedDescription;
+    } else if (!meeting.description && result.summary && !result.summary.includes('tidak tersedia')) {
+      // Fallback: use first sentence of summary
+      const firstSentence = result.summary.split('.')[0].replace(/[*#]/g, '').trim();
+      meeting.description = firstSentence + '.';
+    }
+
+    // Merge/Update action items (candidates)
+    const rawActionItems = Array.isArray(result.actionItems)
+      ? result.actionItems
+      : (Array.isArray(result.action_items) ? result.action_items : []);
+
+
+    if (rawActionItems.length > 0) {
+      const newCandidates = [];
+      for (const item of rawActionItems) {
+        const dueRaw = item.dueDate ?? item.due_date ?? item.dueDateRaw ?? item.due ?? null;
+        let norm = normalizeDate(dueRaw);
+
+        let needsDate = false;
+        // If backend couldn't parse due date, try extracting from transcript near the task text
+        if ((!norm || !norm.date) && meeting.transcription && meeting.transcription.transcript) {
+          try {
+            const query = (item.title || item.text || item.description || '').slice(0, 200);
+            const ext = extractDateFromText(meeting.transcription.transcript, query);
+            if (ext && ext.date) {
+              norm = ext;
+            }
+          } catch (e) {
+            // ignore extraction errors
+          }
+        }
+
+        if (!norm || !norm.date) needsDate = true;
+
+        newCandidates.push({
+          title: item.title || item.text || 'Untitled Task',
+          description: item.description || '',
+          priority: item.priority || 'medium',
+          dueDate: norm && norm.date ? norm.date : null,
+          dueDateRaw: norm && norm.raw ? norm.raw : (dueRaw || null),
+          assigneeName: item.assigneeName || item.assignee_name || null,
+          labels: item.labels || item.labels || [],
+          status: 'todo',
+          needsDate,
+        });
+      }
+
+      // Only overwrite candidates if new items were actually returned
+      meeting.actionItems = newCandidates;
+    }
+
+    await addProcessingLog(meeting, 'Analisis AI berhasil diperbarui.');
+    await meeting.save();
+
+    // Harmonize response (same as in getMeetingById)
+    const meetingObj = meeting.toObject();
+    delete meetingObj.suggestedTitle;
+    delete meetingObj.suggestedDescription;
+    const aiCandidates = meetingObj.actionItems || [];
+    delete meetingObj.actionItems;
+    delete meetingObj.summarySnippet;
+
+    res.json({
+      success: true,
+      message: 'AI metadata regenerated successfully',
+      meeting: meetingObj,
+      actionItems: aiCandidates, // On regeneration, we return the new candidates
+      hasSyncedTasks: false,     // Regeneration usually means tasks aren't synced yet or we want to show new ones
+    });
+  } catch (error) {
+    logger.error('Error regenerating metadata:', error);
+    if (meeting) await addProcessingLog(meeting, `Gagal regenerasi: ${error.message}`);
+    next(error);
+  }
+}
+
+/**
+ * Update speaker name in all or single segment
+ */
+async function updateSpeakerName(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { oldSpeakerName, newSpeakerName, segmentIndex, applyToAll } = req.body;
+
+    if (!newSpeakerName) {
+      return res.status(400).json({ success: false, message: 'New speaker name is required' });
+    }
+
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    // Access check: owner or editor
+    const currentUserId = req.user?.id || req.user?._id;
+    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
+    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
+    const isEditor = meeting.collaborators && meeting.collaborators.some(c => c && c.role === 'editor' && currentUserId && idEquals(c.user, currentUserId));
+
+    if (!isOwner && !isEditor) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have permission to update speaker names for this meeting',
       });
     }
 
     if (!meeting.transcription || !meeting.transcription.segments) {
-      return res.json({
-        success: true,
-        data: {
-          talkTime: [],
-          topics: [],
-        },
-      });
+      return res.status(400).json({ success: false, message: 'No transcription segments found' });
     }
 
-    // Calculate talk time per speaker
-    const talkTimeMap = {};
-    const segments = meeting.transcription.segments || [];
-    
-    if (segments.length === 0) {
-      return res.json({
-        success: true,
-        data: {
-          talkTime: [],
-          topics: [],
-          actionItems: meeting.actionItems || [],
-        },
+    let updatedCount = 0;
+    if (applyToAll) {
+      meeting.transcription.segments.forEach(seg => {
+        if (seg.speaker === oldSpeakerName) {
+          seg.speaker = newSpeakerName;
+          updatedCount++;
+        }
       });
-    }
-    
-    segments.forEach((segment) => {
-      const speaker = segment.speaker || 'SPEAKER_0';
-      if (!talkTimeMap[speaker]) {
-        talkTimeMap[speaker] = {
-          speaker,
-          words: 0,
-          talks: 0,
-          totalDuration: 0,
-        };
+
+      // Also update speakers metadata if exists
+      if (meeting.transcription.speakers) {
+        meeting.transcription.speakers.forEach(s => {
+          if (s.speaker === oldSpeakerName) {
+            s.speaker = newSpeakerName;
+          }
+        });
       }
-      const wordCount = segment.text ? segment.text.trim().split(/\s+/).filter(w => w.length > 0).length : 0;
-      talkTimeMap[speaker].words += wordCount;
-      talkTimeMap[speaker].talks += 1;
-      talkTimeMap[speaker].totalDuration += (segment.end - segment.start);
-    });
-
-    // Calculate total duration and percentages
-    const totalDuration = meeting.duration || (segments.length > 0 ? segments[segments.length - 1].end : 1);
-    const totalTalkDuration = Object.values(talkTimeMap).reduce((sum, item) => sum + item.totalDuration, 0);
-    
-    const talkTime = Object.values(talkTimeMap)
-      .map((item) => ({
-        speaker: item.speaker,
-        words: item.words,
-        talks: item.talks,
-        total: totalTalkDuration > 0 ? Math.round((item.totalDuration / totalTalkDuration) * 100) : 0,
-      }))
-      .sort((a, b) => b.total - a.total); // Sort by percentage descending
-
-    // Extract topics/keywords from tags and transcript
-    const topics = [];
-    if (meeting.tags && meeting.tags.length > 0) {
-      meeting.tags.forEach((tag, index) => {
-        const colors = ['bg-purple-500', 'bg-emerald-500', 'bg-gray-400', 'bg-red-400', 'bg-orange-400'];
-        topics.push({
-          name: tag,
-          color: colors[index % colors.length],
-        });
-      });
+    } else if (segmentIndex !== undefined) {
+      if (meeting.transcription.segments[segmentIndex]) {
+        meeting.transcription.segments[segmentIndex].speaker = newSpeakerName;
+        updatedCount = 1;
+      }
     }
 
-    // Extract keywords from transcript if no tags
-    if (topics.length === 0 && meeting.transcription.transcript) {
-      const commonWords = meeting.transcription.transcript
-        .toLowerCase()
-        .split(/\s+/)
-        .filter(word => word.length > 4)
-        .reduce((acc, word) => {
-          acc[word] = (acc[word] || 0) + 1;
-          return acc;
-        }, {});
-      
-      const topWords = Object.entries(commonWords)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(([word], index) => {
-          const colors = ['bg-purple-500', 'bg-emerald-500', 'bg-gray-400', 'bg-red-400', 'bg-orange-400'];
-          return {
-            name: word.charAt(0).toUpperCase() + word.slice(1),
-            color: colors[index % colors.length],
-          };
-        });
-      
-      topics.push(...topWords);
+    if (updatedCount > 0) {
+      // Mark as modified for Mongoose Mixed types if necessary, though segments is a schema
+      meeting.markModified('transcription.segments');
+      meeting.markModified('transcription.speakers');
+      await meeting.save();
     }
 
     res.json({
       success: true,
-      data: {
-        talkTime,
-        topics,
-        actionItems: meeting.actionItems || [],
-      },
+      message: `Updated ${updatedCount} segments`,
+      updatedCount
     });
   } catch (error) {
-    logger.error('Error getting meeting analytics:', error);
+    logger.error('Error updating speaker name:', error);
     next(error);
   }
 }
@@ -603,11 +1044,13 @@ module.exports = {
   createOnlineMeeting,
   retryTranscription,
   getMeetingAnalytics,
+  regenerateMetadata, // Added
   generateShareLink,
   joinMeeting,
   revokeShareLink,
   updateCollaboratorRole,
   removeCollaborator,
+  updateSpeakerName,
 };
 
 /**
@@ -796,8 +1239,24 @@ async function generateShareLink(req, res, next) {
     }
 
     if (!meeting.shareToken) {
-      meeting.shareToken = nanoid(10);
-      await meeting.save();
+      // Attempt to generate and save a unique shareToken, retrying on duplicate-key
+      const maxRetries = 5;
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        meeting.shareToken = nanoid(10);
+        try {
+          await meeting.save();
+          break;
+        } catch (err) {
+          // Mongo duplicate key error
+          if (err && (err.code === 11000 || err.code === 11001)) {
+            logger.warn(`Share token collision on attempt ${attempt + 1}, retrying`);
+            // try again with a new token
+            if (attempt === maxRetries - 1) throw err;
+            continue;
+          }
+          throw err;
+        }
+      }
     }
 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
@@ -821,23 +1280,47 @@ async function joinMeeting(req, res, next) {
     if (!meeting) {
       return res.status(404).json({ success: false, message: 'Invalid share link' });
     }
+    // Check if user is already owner or collaborator (use idEquals helper)
+    const currentUserId = req.user?.id || req.user?._id;
+    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
+    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
 
-    // Check if user is already owner or collaborator
-    const isOwner = meeting.userId.toString() === req.user.id;
-    const isCollaborator = meeting.collaborators.some(c => c.user && c.user.toString() === req.user.id);
+    // If not owner, atomically add as collaborator only if not already present
+    if (!isOwner) {
+      try {
+        // Atomic conditional update: only push when no collaborator with this user exists
+        const updateResult = await Meeting.updateOne(
+          { _id: meeting._id, 'collaborators.user': { $ne: currentUserId } },
+          { $push: { collaborators: { user: currentUserId, role: COLLABORATOR_ROLES.VIEWER, joinedAt: new Date() } } }
+        );
 
-    if (!isOwner && !isCollaborator) {
-      meeting.collaborators.push({
-        user: req.user.id,
-        role: COLLABORATOR_ROLES.VIEWER
-      });
-      await meeting.save();
+        // If we actually added a collaborator, emit update event
+        if (updateResult && updateResult.modifiedCount && updateResult.modifiedCount > 0) {
+          try {
+            const { emitToMeeting } = require('../services/socketService');
+            const populated = await Meeting.findById(meeting._id)
+              .populate('userId', 'name email image')
+              .populate('collaborators.user', 'name email image');
+            emitToMeeting(String(meeting._id), 'meeting_updated', { meeting: populated.toObject(), userName: req.user.name || 'Collaborator', userId: String(currentUserId) });
+          } catch (e) {
+            console.warn('Failed to emit meeting_updated after join', e);
+          }
+        }
+      } catch (e) {
+        // If update failed for any reason, log and continue to re-fetch for response
+        logger.warn('Failed to atomically add collaborator on join:', e?.message || e);
+      }
     }
+
+    // Re-fetch populated meeting for consistent response shape
+    const populatedMeeting = await Meeting.findById(meeting._id)
+      .populate('userId', 'name email image')
+      .populate('collaborators.user', 'name email image');
 
     res.json({
       success: true,
       message: 'Joined meeting successfully',
-      data: { meetingId: meeting._id }
+      data: { meeting: populatedMeeting }
     });
   } catch (error) {
     next(error);

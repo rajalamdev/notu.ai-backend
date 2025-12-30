@@ -47,26 +47,11 @@ async function transcribeAudio(fileStream, filename, meetingId, options = {}) {
     enableSummary = WHISPERX_DEFAULTS.ENABLE_SUMMARY,
   } = options;
 
-  // Convert stream to buffer with size limit
-  const MAX_BUFFER_SIZE = 100 * 1024 * 1024; // 100MB
-  const chunks = [];
-  let totalSize = 0;
-
-  for await (const chunk of fileStream) {
-    totalSize += chunk.length;
-    
-    if (totalSize > MAX_BUFFER_SIZE) {
-      throw new Error(`File too large: ${totalSize} bytes exceeds maximum ${MAX_BUFFER_SIZE} bytes`);
-    }
-    
-    chunks.push(chunk);
-  }
+  // Stream directly without buffering in memory to handle large files > 100MB
+  // const MAX_BUFFER_SIZE = 100 * 1024 * 1024; // Removed size limit logic
   
-  const buffer = Buffer.concat(chunks);
-  logger.info(`Buffer created: ${totalSize} bytes for file ${filename}`);
-
   const formData = new FormData();
-  formData.append('file', buffer, { filename });
+  formData.append('file', fileStream, { filename });
   formData.append('meeting_id', meetingId);
   formData.append('num_speakers', numSpeakers.toString());
   formData.append('enable_summary', enableSummary.toString());
@@ -74,18 +59,19 @@ async function transcribeAudio(fileStream, filename, meetingId, options = {}) {
   const startTime = Date.now();
 
   try {
-    logger.info(`Sending file to WhisperX API: ${filename} (${buffer.length} bytes), Meeting ID: ${meetingId}`);
+    logger.info(`Sending file stream to WhisperX API: ${filename}, Meeting ID: ${meetingId}`);
     
+    // Calculate headers separately to include boundary
+    const headers = formData.getHeaders();
+
     const response = await axios.post(
       `${config.WHISPERX_API_URL}/transcribe`,
       formData,
       {
-        headers: {
-          ...formData.getHeaders(),
-        },
+        headers,
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
-        timeout: 600000, // 10 minutes
+        timeout: 1800000, // 30 minutes (increased for CPU processing)
       }
     );
 
@@ -124,7 +110,75 @@ async function checkHealth() {
   }
 }
 
+/**
+ * Regenerate AI notes from existing transcript text
+ */
+async function analyzeTranscript(transcript) {
+  const timeout = (typeof arguments[1] === 'object' && arguments[1]?.timeout) || 1800000; // default 30 minutes
+  const start = Date.now();
+  try {
+    const response = await axios.post(
+      `${config.WHISPERX_API_URL}/analyze`,
+      { transcript },
+      { timeout }
+    );
+
+    const processingTime = Math.floor((Date.now() - start) / 1000);
+    // Log simple metrics for monitoring
+    try {
+      const respSize = response && response.data ? JSON.stringify(response.data).length : 0;
+      const keys = response && response.data && typeof response.data === 'object' ? Object.keys(response.data) : [];
+      // Log top-level keys and response size to help debug missing fields
+      logger.info(`Analyze transcript: completed in ${processingTime}s, response size=${respSize} bytes, keys=${keys.join(',')}`);
+
+      // If LLM service includes diagnostics, log them at debug level
+      try {
+        const diag = response.data && (response.data.__llm_diagnostics || response.data.__diagnostics || null);
+        if (diag) logger.debug('Analyze response diagnostics:', diag);
+      } catch (e) {
+        // ignore diagnostics logging errors
+      }
+
+      // Log whether action items exist and their count (if present)
+      try {
+        const ai = response.data && (response.data.actionItems || response.data.action_items || []);
+        const aiCount = Array.isArray(ai) ? ai.length : (ai ? 1 : 0);
+        logger.info(`Analyze transcript: action_items_count=${aiCount}`);
+        try {
+          // Log a compact sample of action items (dueDate/dueDateRaw) to help diagnose parsing issues
+          const sample = Array.isArray(ai) ? ai.slice(0, 5).map(a => ({
+            title: a?.title || a?.text || null,
+            dueDate: a?.dueDate ?? a?.due_date ?? null,
+            dueDateRaw: a?.dueDateRaw ?? a?.due_date_raw ?? null
+          })) : ai;
+          logger.debug('Analyze response action_items sample:', JSON.stringify(sample));
+        } catch (e) {
+          // ignore sample logging errors
+        }
+      } catch (e) {
+        // ignore
+      }
+    } catch (e) {
+      logger.info(`Analyze transcript completed in ${processingTime}s`);
+    }
+
+    return {
+      ...response.data,
+      processingTime,
+    };
+  } catch (error) {
+    const processingTime = Math.floor((Date.now() - start) / 1000);
+    logger.error('Analyze transcript error:', error.message, { processingTime });
+    if (error.response) {
+      logger.error('Analyze transcript response error:', error.response.data);
+      throw new Error(`WhisperX analyze error: ${error.response.data.error || error.message}`);
+    }
+    throw new Error(`WhisperX analyze connection error: ${error.message}`);
+  }
+}
+
 module.exports = {
   transcribeAudio,
+  analyzeTranscript,
   checkHealth,
 };

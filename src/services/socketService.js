@@ -27,6 +27,18 @@ const initSocket = (server) => {
       logger.info(`Client ${socket.id} left board: ${boardId}`);
     });
 
+    // Join a specific meeting room
+    socket.on('join_meeting', (meetingId) => {
+      socket.join(`meeting_${meetingId}`);
+      logger.info(`Client ${socket.id} joined meeting: ${meetingId}`);
+    });
+
+    // Leave a meeting room
+    socket.on('leave_meeting', (meetingId) => {
+      socket.leave(`meeting_${meetingId}`);
+      logger.info(`Client ${socket.id} left meeting: ${meetingId}`);
+    });
+
     // Task created
     socket.on('task_created', (data) => {
       const { boardId, task, userName } = data;
@@ -79,8 +91,16 @@ const emitToBoard = (boardId, event, data) => {
   }
 };
 
+// Helper to emit meeting-scoped events
+const emitToMeeting = (meetingId, event, data) => {
+  if (io) {
+    io.to(`meeting_${meetingId}`).emit(event, data);
+  }
+};
+
 module.exports = {
   initSocket,
   getIo,
   emitToBoard,
+  emitToMeeting,
 };

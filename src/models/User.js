@@ -47,18 +47,7 @@ const userSchema = new mongoose.Schema({
     autoTranscribe: { type: Boolean, default: true },
   },
   
-  // Integrations
-  integrations: {
-    notion: {
-      connected: { type: Boolean, default: false },
-      accessToken: String,
-      workspaceId: String,
-    },
-    googleCalendar: {
-      connected: { type: Boolean, default: false },
-      refreshToken: String,
-    },
-  },
+
   
   // Account status
   isActive: {

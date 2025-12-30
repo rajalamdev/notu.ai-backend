@@ -15,7 +15,7 @@ function createTranscriptionQueue() {
 
   const connection = getRedisClient();
 
-  transcriptionQueue = new Queue(QUEUE_NAMES.TRANSCRIPTION, {
+    transcriptionQueue = new Queue(QUEUE_NAMES.TRANSCRIPTION, {
     connection,
     defaultJobOptions: {
       attempts: MAX_RETRIES,
@@ -23,7 +23,7 @@ function createTranscriptionQueue() {
         type: 'exponential',
         delay: RETRY_DELAY,
       },
-      timeout: 900000, // 15 minutes max per job
+      timeout: 1800000, // 30 minutes max per job (align with WhisperX axios timeout)
       removeOnComplete: {
         count: 100, // Keep last 100 completed jobs
         age: 86400, // Keep for 24 hours
@@ -59,18 +59,39 @@ function getTranscriptionQueue() {
 async function addTranscriptionJob(meetingId, options = {}) {
   try {
     const queue = getTranscriptionQueue();
-    
-    const job = await queue.add(
-      'transcribe',
-      {
-        meetingId,
-        ...options,
-      },
-      {
-        priority: options.priority || 5,
-        jobId: `transcription-${meetingId}`,
-      }
-    );
+    // Support calling with a single options object that contains meetingId
+    let payloadMeetingId = meetingId;
+    let jobOptions = { ...options };
+    if (typeof meetingId === 'object' && meetingId !== null) {
+      jobOptions = { ...meetingId, ...options };
+      payloadMeetingId = meetingId.meetingId || jobOptions.meetingId;
+    }
+
+    if (!payloadMeetingId) throw new Error('meetingId is required to enqueue transcription job');
+
+    const jobId = jobOptions.jobId || `transcription-${payloadMeetingId}`;
+
+    // If a job with same id already exists, return it (idempotency)
+    const existing = await queue.getJob(jobId);
+    if (existing) {
+      logger.info(`Transcription job already exists: ${jobId}`);
+      return existing;
+    }
+
+    const jobPayload = {
+      meetingId: payloadMeetingId,
+      ...(jobOptions.payload || {}),
+    };
+
+    const addOpts = {
+      priority: jobOptions.priority || 5,
+      jobId,
+      attempts: jobOptions.attempts || MAX_RETRIES,
+      backoff: jobOptions.backoff || { type: 'exponential', delay: RETRY_DELAY },
+      timeout: jobOptions.timeout || 1800000,
+    };
+
+    const job = await queue.add('transcribe', jobPayload, addOpts);
 
     logger.info(`Transcription job added to queue: ${job.id}`);
     return job;
@@ -122,7 +143,7 @@ function createTranscriptionWorker(processor) {
     processor,
     {
       connection,
-      concurrency: 2, // Process 2 jobs at a time
+      concurrency: 1, // Process 1 job at a time (Critical for 8GB RAM)
       limiter: {
         max: 5, // Max 5 jobs
         duration: 60000, // per minute

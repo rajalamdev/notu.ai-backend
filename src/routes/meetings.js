@@ -13,11 +13,13 @@ const {
   createOnlineMeeting,
   retryTranscription,
   getMeetingAnalytics,
+  regenerateMetadata,
   generateShareLink,
   joinMeeting,
   revokeShareLink,
   updateCollaboratorRole,
   removeCollaborator,
+  updateSpeakerName,
 } = require('../controllers/meetingController');
 
 const router = express.Router();
@@ -57,6 +59,7 @@ router.get('/:id/status', optionalAuth, asyncHandler(getMeetingStatus));
  * Retry failed transcription
  */
 router.post('/:id/retry', authenticate, asyncHandler(retryTranscription));
+router.post('/:id/regenerate-ai', authenticate, asyncHandler(regenerateMetadata));
 
 /**
  * PATCH /api/meetings/:id
@@ -79,7 +82,7 @@ router.delete('/:id', authenticate, asyncHandler(deleteMeeting));
  * GET /api/meetings/:id/export
  * Export transcript as plain text
  */
-router.get('/:id/export', asyncHandler(exportTranscript));
+router.get('/:id/export', optionalAuth, asyncHandler(exportTranscript));
 
 /**
  * GET /api/meetings/:id/analytics
@@ -95,5 +98,6 @@ router.post('/join/:token', authenticate, asyncHandler(joinMeeting));
 router.delete('/:id/share', authenticate, asyncHandler(revokeShareLink));
 router.patch('/:id/collaborators/:userId', authenticate, asyncHandler(updateCollaboratorRole));
 router.delete('/:id/collaborators/:userId', authenticate, asyncHandler(removeCollaborator));
+router.patch('/:id/segments/speaker', authenticate, asyncHandler(updateSpeakerName));
 
 module.exports = router;
