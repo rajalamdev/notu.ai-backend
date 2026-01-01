@@ -23,7 +23,7 @@ const taskSchema = new mongoose.Schema({
   title: {
     type: String,
     required: true,
-    yotrim: true,
+    trim: true,
   },
   description: {
     type: String,
@@ -31,7 +31,7 @@ const taskSchema = new mongoose.Schema({
   },
   status: {
     type: String,
-    enum: ['todo', 'in_progress', 'done'],
+    enum: ['todo', 'in-progress', 'review', 'done'],
     default: 'todo',
   },
   priority: {

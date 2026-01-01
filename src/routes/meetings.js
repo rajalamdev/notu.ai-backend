@@ -20,6 +20,9 @@ const {
   updateCollaboratorRole,
   removeCollaborator,
   updateSpeakerName,
+  askAI,
+  getChatHistory,
+  clearChatHistory,
 } = require('../controllers/meetingController');
 
 const router = express.Router();
@@ -99,5 +102,12 @@ router.delete('/:id/share', authenticate, asyncHandler(revokeShareLink));
 router.patch('/:id/collaborators/:userId', authenticate, asyncHandler(updateCollaboratorRole));
 router.delete('/:id/collaborators/:userId', authenticate, asyncHandler(removeCollaborator));
 router.patch('/:id/segments/speaker', authenticate, asyncHandler(updateSpeakerName));
+
+/**
+ * Ask AI - Chat with meeting context
+ */
+router.post('/:id/ask', authenticate, asyncHandler(askAI));
+router.get('/:id/chat', authenticate, asyncHandler(getChatHistory));
+router.delete('/:id/chat', authenticate, asyncHandler(clearChatHistory));
 
 module.exports = router;

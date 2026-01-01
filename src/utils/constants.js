@@ -58,7 +58,31 @@ module.exports = {
   // Collaborator roles
   COLLABORATOR_ROLES: {
     OWNER: 'owner',
+    ADMIN: 'admin',
     EDITOR: 'editor',
     VIEWER: 'viewer',
+  },
+
+  // Task status (consistent with Task model enum)
+  TASK_STATUS: {
+    TODO: 'todo',
+    IN_PROGRESS: 'in-progress',
+    REVIEW: 'review',
+    DONE: 'done',
+  },
+
+  // Task priority
+  TASK_PRIORITY: {
+    LOW: 'low',
+    MEDIUM: 'medium',
+    HIGH: 'high',
+    URGENT: 'urgent',
+  },
+
+  // Pagination defaults
+  PAGINATION: {
+    DEFAULT_PAGE: 1,
+    DEFAULT_LIMIT: 10,
+    MAX_LIMIT: 100,
   },
 };

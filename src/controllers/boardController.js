@@ -3,10 +3,12 @@ const Board = require('../models/Board');
 const Task = require('../models/Task');
 const Meeting = require('../models/Meeting');
 const { idEquals } = require('../utils/idEquals');
+const { getResourcePermission, isValidRole, canAssignRole } = require('../utils/permissions');
 const User = require('../models/User');
 const crypto = require('crypto');
 const nanoid = (size = 10) => crypto.randomBytes(size).toString('hex').slice(0, size);
 const { COLLABORATOR_ROLES } = require('../utils/constants');
+const logger = require('../utils/logger');
 
 exports.getBoards = async (req, res) => {
   try {
@@ -15,6 +17,7 @@ exports.getBoards = async (req, res) => {
     const limit = parseInt(req.query.limit, 10) || 12;
     const skip = (page - 1) * limit;
     const search = req.query.search;
+    const currentUserId = req.user?.id || req.user?._id;
 
     let query = {};
 
@@ -56,16 +59,32 @@ exports.getBoards = async (req, res) => {
 
     const boards = await Board.find(query)
       .populate('userId', 'name email image')
+      .populate('collaborators.user', 'name email image')
+      .populate('meetingId', 'title')
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(limit);
+      .limit(limit)
+      .lean();
 
     const total = await Board.countDocuments(query);
 
+    // Map boards with permission info
+    const boardsWithRole = boards.map(board => {
+      const permission = getResourcePermission(board, currentUserId);
+      return {
+        ...board,
+        userRole: permission.role || 'viewer',
+        isOwner: permission.isOwner,
+        canEdit: permission.canEdit,
+        canDelete: permission.canDelete,
+        canManageCollaborators: permission.canManageCollaborators,
+      };
+    });
+
     res.json({
       success: true,
-      count: boards.length,
-      data: boards,
+      count: boardsWithRole.length,
+      data: boardsWithRole,
       pagination: {
         page,
         limit,
@@ -74,7 +93,7 @@ exports.getBoards = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error(error);
+    logger.error('getBoards error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
@@ -215,34 +234,54 @@ exports.deleteBoard = async (req, res) => {
     const board = await Board.findById(id);
     if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
 
-    // Permission: allow deletion by board owner, a collaborator, or the meeting owner (if tied to a meeting).
-    const isOwner = idEquals(board.userId, req.user.id);
-    const isCollaborator = Array.isArray(board.collaborators) && board.collaborators.some(c => c && c.user && idEquals(c.user, req.user.id));
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
 
+    // Also allow meeting owner to delete the board
     let isMeetingOwner = false;
-    if (!isOwner && board.meetingId) {
+    if (!permission.canDelete && board.meetingId) {
       try {
         const meeting = await Meeting.findById(board.meetingId);
-        if (meeting && String(meeting.userId) === String(req.user.id)) {
+        if (meeting && idEquals(meeting.userId, currentUserId)) {
           isMeetingOwner = true;
         }
       } catch (e) {
-        // ignore lookup errors and fall through to permission check
+        // ignore lookup errors
       }
     }
 
-    if (!isOwner && !isCollaborator && !isMeetingOwner) {
-      return res.status(403).json({ success: false, message: 'Only owner can delete board' });
+    if (!permission.canDelete && !isMeetingOwner) {
+      return res.status(403).json({ success: false, message: 'Only owner or admin can delete board' });
     }
 
-    // Unset boardId from tasks rather than deleting tasks
-    await Task.updateMany({ boardId: board._id }, { $unset: { boardId: "" } });
+    // Delete all tasks in board (CASCADE to tasks)
+    const taskDelResult = await Task.deleteMany({ boardId: board._id });
+    logger.info(`Deleted ${taskDelResult.deletedCount} tasks for board ${id}`);
+
+    // If board is linked to a meeting, just unlink it (DO NOT delete meeting)
+    if (board.meetingId) {
+      // Optionally: clear related tasks from meeting (unset meetingId from orphan tasks)
+      await Task.updateMany({ meetingId: board.meetingId, boardId: board._id }, { $unset: { boardId: '' } });
+      logger.info(`Unlinked board ${id} from meeting ${board.meetingId}`);
+    }
 
     await board.deleteOne();
 
-    res.json({ success: true, message: 'Board deleted' });
+    // Emit socket event
+    try {
+      const { emitToBoard } = require('../services/socketService');
+      emitToBoard(id, 'board_deleted', { boardId: id, deletedBy: currentUserId });
+    } catch (e) {
+      logger.warn('Failed to emit board_deleted event', e);
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Board and tasks deleted successfully',
+      deletedTasksCount: taskDelResult.deletedCount || 0,
+    });
   } catch (error) {
-    console.error(error);
+    logger.error('deleteBoard error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
@@ -456,9 +495,16 @@ exports.updateBoard = async (req, res) => {
  */
 exports.generateShareLink = async (req, res) => {
   try {
-    const board = await Board.findOne({ _id: req.params.id, userId: req.user.id });
+    const board = await Board.findById(req.params.id);
     if (!board) {
       return res.status(404).json({ success: false, message: 'Board not found' });
+    }
+
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
+
+    if (!permission.canShare) {
+      return res.status(403).json({ success: false, message: 'Only owners and admins can generate share links' });
     }
 
     if (!board.shareToken) {
@@ -470,7 +516,7 @@ exports.generateShareLink = async (req, res) => {
           break;
         } catch (err) {
           if (err && (err.code === 11000 || err.code === 11001)) {
-            console.warn(`Share token collision on attempt ${attempt + 1} for board ${board._id}, retrying`);
+            logger.warn(`Share token collision on attempt ${attempt + 1} for board ${board._id}, retrying`);
             if (attempt === maxRetries - 1) throw err;
             continue;
           }
@@ -488,6 +534,7 @@ exports.generateShareLink = async (req, res) => {
       }
     });
   } catch (error) {
+    logger.error('generateShareLink error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
@@ -501,149 +548,193 @@ exports.joinBoard = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Invalid share link' });
     }
 
-    // Normalize ids for robust comparison
-    const reqUserIdStr = String(req.user?.id || req.user?._id || '');
-    const boardOwnerIdStr = (board.userId && board.userId._id) ? String(board.userId._id) : String(board.userId);
-    const isOwner = !!(reqUserIdStr && boardOwnerIdStr === reqUserIdStr);
-    const isCollaborator = Array.isArray(board.collaborators) && board.collaborators.some(c => {
-      try {
-        const uid = (c && c.user && c.user._id) ? String(c.user._id) : String(c && c.user);
-        return uid === reqUserIdStr;
-      } catch (e) { return false; }
-    });
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
 
-    if (!isOwner && !isCollaborator) {
-      try {
-        const updateResult = await Board.updateOne(
-          { _id: board._id, 'collaborators.user': { $ne: req.user.id } },
-          { $push: { collaborators: { user: req.user.id, role: COLLABORATOR_ROLES.VIEWER, joinedAt: new Date() } } }
-        );
-
-        if (!(updateResult && updateResult.modifiedCount && updateResult.modifiedCount > 0)) {
-          // nothing modified: collaborator likely already present — continue
+    // If user already has access, return their current role
+    if (permission.canView) {
+      const populated = await Board.findById(board._id)
+        .populate('userId', 'name email image')
+        .populate('collaborators.user', 'name email image');
+      
+      return res.json({
+        success: true,
+        message: permission.isOwner ? 'You are the owner of this board' : 'You are already a member of this board',
+        data: {
+          board: {
+            _id: populated._id,
+            id: populated._id,
+            title: populated.title,
+          },
+          boardId: populated._id,
+          role: permission.role,
+          userRole: permission.role,
+          alreadyMember: true,
         }
-      } catch (e) {
-        console.warn('Failed to atomically add collaborator on joinBoard:', e?.message || e);
-      }
+      });
     }
 
-    // Re-fetch and populate so clients get the latest collaborator list and owner info
+    // Add as viewer collaborator
+    try {
+      const updateResult = await Board.updateOne(
+        { _id: board._id, 'collaborators.user': { $ne: currentUserId } },
+        { $push: { collaborators: { user: currentUserId, role: COLLABORATOR_ROLES.VIEWER, joinedAt: new Date() } } }
+      );
+
+      if (updateResult && updateResult.modifiedCount > 0) {
+        try {
+          const { emitCollaboratorJoined } = require('../services/socketService');
+          emitCollaboratorJoined('board', String(board._id), {
+            id: currentUserId,
+            name: req.user?.name || 'Anonymous',
+            image: req.user?.image || null,
+          }, COLLABORATOR_ROLES.VIEWER);
+        } catch (e) {
+          logger.warn('Failed to emit collaborator_joined after board join', e);
+        }
+      }
+    } catch (e) {
+      logger.warn('Failed to atomically add collaborator on joinBoard:', e?.message || e);
+    }
+
+    // Re-fetch and populate for response
     const populated = await Board.findById(board._id)
       .populate('userId', 'name email image')
       .populate('collaborators.user', 'name email image');
-
-    const boardObj = populated ? populated.toObject() : board.toObject();
-
-    // Backfill collaborator user display fields when populate failed or returned partial objects
-    try {
-      const collabs = Array.isArray(boardObj.collaborators) ? boardObj.collaborators : [];
-      const missingUserIds = collabs
-        .map(c => c && (c.user?._id ? String(c.user._id) : (c.user ? String(c.user) : null)))
-        .filter(Boolean)
-        .filter(id => {
-          const c = collabs.find(x => String(x.user?._id ?? x.user) === id);
-          return !c.user || typeof c.user !== 'object' || !c.user.name;
-        });
-
-      if (missingUserIds.length) {
-        const users = await User.find({ _id: { $in: missingUserIds } }).select('name image');
-        const userMap = new Map(users.map(u => [String(u._id), u]));
-        boardObj.collaborators = collabs.map(c => {
-          if (!c) return c;
-          const uid = c.user?._id ? String(c.user._id) : (c.user ? String(c.user) : null);
-          if (!uid) return c;
-          const u = userMap.get(uid);
-          if (u) {
-            return { ...c, user: { _id: u._id, name: u.name || 'Unknown', image: u.image || null } };
-          }
-          return { ...c, user: { _id: uid, name: c.user && c.user.name ? c.user.name : 'Unknown', image: c.user && c.user.image ? c.user.image : null } };
-        });
-      }
-    } catch (e) {
-      console.warn('Failed to backfill board collaborators after joinBoard', e?.message || e);
-    }
-
-    // Compute requester role
-    const isOwnerAfter = boardObj.userId && (boardObj.userId._id ? String(boardObj.userId._id) === req.user.id : String(boardObj.userId) === req.user.id);
-    const isCollaboratorAfter = Array.isArray(boardObj.collaborators) && boardObj.collaborators.some(c => String(c.user?._id ?? c.user) === req.user.id);
-    let userRoleAfter = 'viewer';
-    if (isOwnerAfter) userRoleAfter = 'owner';
-    else if (isCollaboratorAfter) {
-      const col = boardObj.collaborators.find(c => String(c.user?._id ?? c.user) === req.user.id);
-      if (col && col.role) userRoleAfter = col.role;
-    }
-
-    // Emit update so owners currently viewing will see the new collaborator (best-effort)
-    try {
-      const { emitToBoard } = require('../services/socketService');
-      emitToBoard(String(board._id), 'board_updated', {
-        board: boardObj,
-        userName: req.user.name || 'Collaborator',
-        userId: req.user.id
-      });
-    } catch (e) {
-      console.warn('Socket emit failed after joinBoard', e);
-    }
 
     res.json({
       success: true,
       message: 'Joined board successfully',
       data: {
-        board: boardObj,
-        userRole: userRoleAfter,
-        boardId: board._id
+        board: {
+          _id: populated._id,
+          id: populated._id,
+          title: populated.title,
+        },
+        boardId: populated._id,
+        role: COLLABORATOR_ROLES.VIEWER,
+        userRole: COLLABORATOR_ROLES.VIEWER,
+        alreadyMember: false,
       }
     });
   } catch (error) {
+    logger.error('joinBoard error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
 
 exports.updateCollaboratorRole = async (req, res) => {
   try {
-    const { id, userId } = req.params;
+    const { id, odellollaboratorId } = req.params;
     const { role } = req.body;
+    const collaboratorId = odellollaboratorId || req.params.userId;
 
-    const board = await Board.findOne({ _id: id, userId: req.user.id });
-    if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
+    // Validate role
+    if (!role || !isValidRole(role) || role === COLLABORATOR_ROLES.OWNER) {
+      return res.status(400).json({ success: false, message: 'Invalid role. Allowed: admin, editor, viewer' });
+    }
 
-    const col = board.collaborators.find(c => c && c.user && idEquals(c.user, userId));
-    if (!col) return res.status(404).json({ success: false, message: 'Collaborator not found' });
+    const board = await Board.findById(id);
+    if (!board) {
+      return res.status(404).json({ success: false, message: 'Board not found' });
+    }
+
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
+
+    if (!permission.canManageCollaborators) {
+      return res.status(403).json({ success: false, message: 'Only owners and admins can update roles' });
+    }
+
+    if (!canAssignRole(permission.role, role)) {
+      return res.status(403).json({ success: false, message: 'You cannot assign this role level' });
+    }
+
+    const col = board.collaborators.find(c => c && c.user && idEquals(c.user, collaboratorId));
+    if (!col) {
+      return res.status(404).json({ success: false, message: 'Collaborator not found' });
+    }
 
     col.role = role;
     await board.save();
 
-    res.json({ success: true, message: 'Role updated' });
+    // Emit socket event
+    try {
+      const { emitCollaboratorRoleChanged } = require('../services/socketService');
+      emitCollaboratorRoleChanged('board', String(board._id), collaboratorId, role);
+    } catch (e) {
+      logger.warn('Failed to emit role change event', e);
+    }
+
+    res.json({ success: true, message: 'Role updated', data: { collaboratorId, newRole: role } });
   } catch (error) {
+    logger.error('updateCollaboratorRole error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
 
 exports.removeCollaborator = async (req, res) => {
   try {
-    const { id, userId } = req.params;
-    const board = await Board.findOne({ _id: id, userId: req.user.id });
-    if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
+    const { id, odellollaboratorId } = req.params;
+    const collaboratorId = odellollaboratorId || req.params.userId;
 
-    board.collaborators = board.collaborators.filter(c => !(c && c.user && idEquals(c.user, userId)));
+    const board = await Board.findById(id);
+    if (!board) {
+      return res.status(404).json({ success: false, message: 'Board not found' });
+    }
+
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
+    const isSelfRemoval = idEquals(collaboratorId, currentUserId);
+
+    if (!isSelfRemoval && !permission.canManageCollaborators) {
+      return res.status(403).json({ success: false, message: 'Permission denied' });
+    }
+
+    const originalLength = board.collaborators.length;
+    board.collaborators = board.collaborators.filter(c => !(c && c.user && idEquals(c.user, collaboratorId)));
+
+    if (board.collaborators.length === originalLength) {
+      return res.status(404).json({ success: false, message: 'Collaborator not found' });
+    }
+
     await board.save();
+
+    // Emit socket event
+    try {
+      const { emitCollaboratorRemoved } = require('../services/socketService');
+      emitCollaboratorRemoved('board', String(board._id), collaboratorId);
+    } catch (e) {
+      logger.warn('Failed to emit collaborator removed event', e);
+    }
 
     res.json({ success: true, message: 'Collaborator removed' });
   } catch (error) {
+    logger.error('removeCollaborator error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };
 
 exports.revokeShareLink = async (req, res) => {
   try {
-    const board = await Board.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!board) return res.status(404).json({ success: false, message: 'Board not found' });
+    const board = await Board.findById(req.params.id);
+    if (!board) {
+      return res.status(404).json({ success: false, message: 'Board not found' });
+    }
+
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
+
+    if (!permission.canShare) {
+      return res.status(403).json({ success: false, message: 'Only owners and admins can revoke share links' });
+    }
 
     board.shareToken = undefined;
     await board.save();
 
     res.json({ success: true, message: 'Share link revoked' });
   } catch (error) {
+    logger.error('revokeShareLink error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };

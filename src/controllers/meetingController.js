@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 const Meeting = require('../models/Meeting');
 const Task = require('../models/Task');
 const Board = require('../models/Board');
+const ChatMessage = require('../models/ChatMessage');
 const { removeFile, getFileUrl } = require('../services/storageService');
 const { getJobStatus } = require('../services/queueService');
 const crypto = require('crypto');
@@ -12,6 +13,7 @@ const axios = require('axios');
 const logger = require('../utils/logger');
 const { normalizeDate, extractDateFromText } = require('../utils/dateUtils');
 const { idEquals } = require('../utils/idEquals');
+const { getResourcePermission } = require('../utils/permissions');
 const User = require('../models/User');
 
 /**
@@ -189,17 +191,9 @@ async function getAllMeetings(req, res, next) {
       const title = obj.title || obj.suggestedTitle || 'Untitled Meeting';
 
       const currentUserId = req.user?.id || req.user?._id;
-      // Consider user owner if either they are the document owner or they are a collaborator with role 'owner'
-      const isCollaborator = req.user && obj.collaborators && Array.isArray(obj.collaborators) && obj.collaborators.some(c => c && c.user && idEquals(c.user, currentUserId));
-      const hasOwnerRole = req.user && obj.collaborators && Array.isArray(obj.collaborators) && obj.collaborators.some(c => c && c.user && c.role === COLLABORATOR_ROLES.OWNER && idEquals(c.user, currentUserId));
-      const isOwner = !!(req.user && (idEquals(obj.userId, currentUserId) || hasOwnerRole));
-
-      let userRole = 'viewer';
-      if (isOwner) userRole = 'owner';
-      else if (isCollaborator) {
-        const col = obj.collaborators.find(c => c && c.user && idEquals(c.user, currentUserId));
-        userRole = col ? col.role : 'viewer';
-      }
+      
+      // Use centralized permission helper for consistent role detection
+      const permission = getResourcePermission(obj, currentUserId);
 
       // Provide a lightweight summary for list previews (use transcription.summary only)
       const summarySnippet = obj.transcription && obj.transcription.summary ? String(obj.transcription.summary).slice(0, 200) : '';
@@ -217,9 +211,12 @@ async function getAllMeetings(req, res, next) {
         updatedAt: obj.updatedAt,
         userId: obj.userId,
         isPublic: obj.isPublic || false,
-        isOwner,
-        isCollaborator,
-        userRole,
+        isOwner: permission.isOwner,
+        isCollaborator: permission.canView && !permission.isOwner,
+        userRole: permission.role || 'viewer',
+        canEdit: permission.canEdit,
+        canDelete: permission.canDelete,
+        canManageCollaborators: permission.canManageCollaborators,
         actionItemCount: actionCount,
         hasBoard,
       };
@@ -592,14 +589,15 @@ async function deleteMeeting(req, res, next) {
       });
     }
 
-    // Access check: Only owner can delete
-    const currentUserId = req.user?.id?.toString() || req.user?._id?.toString();
-    const meetingOwnerId = meeting.userId?._id?.toString() || meeting.userId?.toString();
-    if (!currentUserId || meetingOwnerId !== currentUserId) {
+    // Access check: Only owner or admin can delete
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(meeting, currentUserId);
+    
+    if (!permission.canDelete) {
       return res.status(403).json({
         success: false,
         error: 'Forbidden',
-        message: 'Only the meeting owner can delete it',
+        message: 'Only the meeting owner or admin can delete it',
       });
     }
 
@@ -613,30 +611,44 @@ async function deleteMeeting(req, res, next) {
       }
     }
 
-    // Delete associated boards and tasks
+    // CASCADE DELETE: Delete associated boards and their tasks
     const meetingObjectId = new mongoose.Types.ObjectId(id);
 
     const boards = await Board.find({ meetingId: meetingObjectId });
     logger.info(`Cleaning up ${boards.length} boards for meeting ${id}`);
     
     for (const board of boards) {
-      await Task.deleteMany({ boardId: board._id });
-      logger.info(`Deleted tasks for board ${board._id}`);
+      // Delete all tasks in each board
+      const taskDelResult = await Task.deleteMany({ boardId: board._id });
+      logger.info(`Deleted ${taskDelResult.deletedCount} tasks for board ${board._id}`);
     }
     
+    // Delete all boards linked to this meeting
     const boardDelResult = await Board.deleteMany({ meetingId: meetingObjectId });
     logger.info(`Deleted ${boardDelResult.deletedCount} boards`);
     
-    // Also delete any orphan tasks tied to meeting but no board (or redundant check)
-    const taskDelResult = await Task.deleteMany({ meetingId: meetingObjectId });
-    logger.info(`Deleted ${taskDelResult.deletedCount} tasks for meeting ${id}`);
+    // Also delete any orphan tasks tied to meeting but no board
+    const orphanTaskDelResult = await Task.deleteMany({ meetingId: meetingObjectId });
+    logger.info(`Deleted ${orphanTaskDelResult.deletedCount} orphan tasks for meeting ${id}`);
+
+    // Emit socket event for real-time update
+    try {
+      const { emitToMeeting } = require('../services/socketService');
+      emitToMeeting(String(meeting._id), 'meeting_deleted', { 
+        meetingId: String(meeting._id),
+        deletedBy: currentUserId 
+      });
+    } catch (e) {
+      logger.warn('Failed to emit meeting_deleted event', e);
+    }
 
     // Delete meeting from database
     await Meeting.findByIdAndDelete(id);
 
     res.json({
       success: true,
-      message: 'Meeting deleted successfully',
+      message: 'Meeting and related boards/tasks deleted successfully',
+      deletedBoardsCount: boardDelResult.deletedCount || 0,
     });
   } catch (error) {
     logger.error('Error deleting meeting:', error);
@@ -1033,6 +1045,272 @@ async function updateSpeakerName(req, res, next) {
   }
 }
 
+/**
+ * Ask AI a question about the meeting context
+ * POST /api/meetings/:id/ask
+ */
+async function askAI(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { question } = req.body;
+    const userId = req.user?.id || req.user?._id;
+
+    if (!question || typeof question !== 'string' || question.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Question is required',
+      });
+    }
+
+    // Find meeting and check permissions
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    const permission = getResourcePermission(meeting, userId);
+    if (!permission.canView) {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    // Save user's question to chat history
+    const userMessage = await ChatMessage.addMessage(id, userId, 'user', question.trim());
+
+    // Build context from meeting data
+    const meetingContext = buildMeetingContext(meeting);
+    
+    // Get recent chat history for context (last 10 messages)
+    const chatHistory = await ChatMessage.find({ meetingId: id })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .lean();
+    chatHistory.reverse(); // Oldest first
+
+    // Call LLM service
+    const startTime = Date.now();
+    let aiResponse;
+    try {
+      aiResponse = await callLLMForQuestion(meetingContext, chatHistory, question.trim());
+    } catch (llmError) {
+      logger.error('LLM service error:', llmError);
+      // Save error message
+      await ChatMessage.addMessage(id, null, 'assistant', 
+        'Maaf, terjadi kesalahan saat memproses pertanyaan Anda. Silakan coba lagi.',
+        { error: llmError.message }
+      );
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to process question',
+        error: llmError.message,
+      });
+    }
+    const responseTime = Date.now() - startTime;
+
+    // Save AI response to chat history
+    const assistantMessage = await ChatMessage.addMessage(id, null, 'assistant', aiResponse, {
+      responseTime,
+      model: process.env.LLM_MODEL || 'google/gemma-3-4b-it:free',
+    });
+
+    res.json({
+      success: true,
+      data: {
+        question: userMessage.content,
+        answer: assistantMessage.content,
+        messageId: assistantMessage._id,
+        responseTime,
+      },
+    });
+  } catch (error) {
+    logger.error('Ask AI error:', error);
+    next(error);
+  }
+}
+
+/**
+ * Get chat history for a meeting
+ * GET /api/meetings/:id/chat
+ */
+async function getChatHistory(req, res, next) {
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id || req.user?._id;
+    const limit = parseInt(req.query.limit) || 50;
+
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    const permission = getResourcePermission(meeting, userId);
+    if (!permission.canView) {
+      return res.status(403).json({ success: false, message: 'Access denied' });
+    }
+
+    const messages = await ChatMessage.getChatHistory(id, limit);
+
+    res.json({
+      success: true,
+      data: messages,
+    });
+  } catch (error) {
+    logger.error('Get chat history error:', error);
+    next(error);
+  }
+}
+
+/**
+ * Clear chat history for a meeting
+ * DELETE /api/meetings/:id/chat
+ */
+async function clearChatHistory(req, res, next) {
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id || req.user?._id;
+
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    const permission = getResourcePermission(meeting, userId);
+    if (!permission.canManageCollaborators) {
+      return res.status(403).json({ success: false, message: 'Only owner or admin can clear chat history' });
+    }
+
+    await ChatMessage.clearHistory(id);
+
+    res.json({
+      success: true,
+      message: 'Chat history cleared',
+    });
+  } catch (error) {
+    logger.error('Clear chat history error:', error);
+    next(error);
+  }
+}
+
+/**
+ * Build meeting context for LLM
+ */
+function buildMeetingContext(meeting) {
+  let context = `# Meeting: ${meeting.title}\n\n`;
+  
+  if (meeting.description) {
+    context += `## Description\n${meeting.description}\n\n`;
+  }
+
+  if (meeting.aiNotes) {
+    if (meeting.aiNotes.summary) {
+      context += `## Summary\n${meeting.aiNotes.summary}\n\n`;
+    }
+    if (meeting.aiNotes.highlights && typeof meeting.aiNotes.highlights === 'object') {
+      context += `## Key Points\n`;
+      for (const [topic, content] of Object.entries(meeting.aiNotes.highlights)) {
+        context += `### ${topic}\n${content}\n\n`;
+      }
+    }
+    if (meeting.aiNotes.conclusion) {
+      context += `## Conclusion\n${meeting.aiNotes.conclusion}\n\n`;
+    }
+    if (meeting.aiNotes.actionItems && meeting.aiNotes.actionItems.length > 0) {
+      context += `## Action Items\n`;
+      meeting.aiNotes.actionItems.forEach((item, i) => {
+        context += `${i + 1}. ${item.title}${item.description ? ': ' + item.description : ''}\n`;
+      });
+      context += '\n';
+    }
+  }
+
+  if (meeting.transcription && meeting.transcription.segments) {
+    context += `## Transcript Excerpts\n`;
+    // Include first 50 segments as context (to avoid token limits)
+    const segments = meeting.transcription.segments.slice(0, 50);
+    segments.forEach(seg => {
+      const speaker = seg.speaker || 'Speaker';
+      context += `[${speaker}]: ${seg.text}\n`;
+    });
+  }
+
+  return context;
+}
+
+/**
+ * Call LLM service for question answering
+ */
+async function callLLMForQuestion(meetingContext, chatHistory, question) {
+  const WHISPER_URL = config.FASTER_WHISPER_URL || 'http://localhost:8000';
+  
+  // Build messages array for chat completion
+  const messages = [
+    {
+      role: 'system',
+      content: `Kamu adalah asisten AI yang membantu menjawab pertanyaan tentang notulensi rapat.
+Berdasarkan konteks rapat yang diberikan, jawab pertanyaan user dengan jelas dan ringkas.
+Jika informasi tidak tersedia dalam konteks, katakan dengan jujur bahwa informasi tersebut tidak ada dalam notulensi.
+Jawab dalam bahasa Indonesia.`
+    },
+    {
+      role: 'user',
+      content: `Konteks Rapat:\n${meetingContext}`
+    }
+  ];
+
+  // Add chat history
+  chatHistory.forEach(msg => {
+    if (msg.role === 'user' || msg.role === 'assistant') {
+      messages.push({ role: msg.role, content: msg.content });
+    }
+  });
+
+  // Add current question (if not already in history)
+  const lastMsg = messages[messages.length - 1];
+  if (lastMsg.role !== 'user' || lastMsg.content !== question) {
+    messages.push({ role: 'user', content: question });
+  }
+
+  try {
+    const response = await axios.post(`${WHISPER_URL}/api/chat`, {
+      messages,
+      max_tokens: 1000,
+    }, {
+      timeout: 60000,
+    });
+
+    if (response.data && response.data.response) {
+      return response.data.response;
+    }
+    throw new Error('Invalid LLM response');
+  } catch (error) {
+    // Fallback: Try direct OpenRouter if faster-whisper endpoint fails
+    if (process.env.OPENROUTER_API_KEY) {
+      return await callOpenRouterDirect(messages);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Direct OpenRouter call as fallback
+ */
+async function callOpenRouterDirect(messages) {
+  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+    model: process.env.LLM_MODEL || 'google/gemma-3-4b-it:free',
+    messages,
+  }, {
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 60000,
+  });
+
+  if (response.data?.choices?.[0]?.message?.content) {
+    return response.data.choices[0].message.content;
+  }
+  throw new Error('Invalid OpenRouter response');
+}
+
 module.exports = {
   getAllMeetings,
   getMeetingById,
@@ -1044,13 +1322,16 @@ module.exports = {
   createOnlineMeeting,
   retryTranscription,
   getMeetingAnalytics,
-  regenerateMetadata, // Added
+  regenerateMetadata,
   generateShareLink,
   joinMeeting,
   revokeShareLink,
   updateCollaboratorRole,
   removeCollaborator,
   updateSpeakerName,
+  askAI,
+  getChatHistory,
+  clearChatHistory,
 };
 
 /**
@@ -1232,10 +1513,18 @@ async function retryTranscription(req, res, next) {
 async function generateShareLink(req, res, next) {
   try {
     const { id } = req.params;
-    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+    const meeting = await Meeting.findById(id);
 
     if (!meeting) {
       return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    // Check permission - only owner or admin can generate share link
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(meeting, currentUserId);
+    
+    if (!permission.canShare) {
+      return res.status(403).json({ success: false, message: 'Only owners and admins can generate share links' });
     }
 
     if (!meeting.shareToken) {
@@ -1268,6 +1557,7 @@ async function generateShareLink(req, res, next) {
       }
     });
   } catch (error) {
+    logger.error('Error generating share link:', error);
     next(error);
   }
 }
@@ -1280,36 +1570,55 @@ async function joinMeeting(req, res, next) {
     if (!meeting) {
       return res.status(404).json({ success: false, message: 'Invalid share link' });
     }
-    // Check if user is already owner or collaborator (use idEquals helper)
+    
     const currentUserId = req.user?.id || req.user?._id;
-    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
-    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
+    const permission = getResourcePermission(meeting, currentUserId);
 
-    // If not owner, atomically add as collaborator only if not already present
-    if (!isOwner) {
-      try {
-        // Atomic conditional update: only push when no collaborator with this user exists
-        const updateResult = await Meeting.updateOne(
-          { _id: meeting._id, 'collaborators.user': { $ne: currentUserId } },
-          { $push: { collaborators: { user: currentUserId, role: COLLABORATOR_ROLES.VIEWER, joinedAt: new Date() } } }
-        );
-
-        // If we actually added a collaborator, emit update event
-        if (updateResult && updateResult.modifiedCount && updateResult.modifiedCount > 0) {
-          try {
-            const { emitToMeeting } = require('../services/socketService');
-            const populated = await Meeting.findById(meeting._id)
-              .populate('userId', 'name email image')
-              .populate('collaborators.user', 'name email image');
-            emitToMeeting(String(meeting._id), 'meeting_updated', { meeting: populated.toObject(), userName: req.user.name || 'Collaborator', userId: String(currentUserId) });
-          } catch (e) {
-            console.warn('Failed to emit meeting_updated after join', e);
-          }
+    // If user already has access, return their current role
+    if (permission.canView) {
+      // Re-fetch with populate for response
+      const populatedMeeting = await Meeting.findById(meeting._id)
+        .populate('userId', 'name email image')
+        .populate('collaborators.user', 'name email image');
+      
+      return res.json({
+        success: true,
+        message: permission.isOwner ? 'You are the owner of this meeting' : 'You are already a member of this meeting',
+        data: { 
+          meeting: {
+            _id: populatedMeeting._id,
+            id: populatedMeeting._id,
+            title: populatedMeeting.title,
+          },
+          meetingId: populatedMeeting._id,
+          role: permission.role,
+          alreadyMember: true,
         }
-      } catch (e) {
-        // If update failed for any reason, log and continue to re-fetch for response
-        logger.warn('Failed to atomically add collaborator on join:', e?.message || e);
+      });
+    }
+
+    // Add as viewer collaborator
+    try {
+      const updateResult = await Meeting.updateOne(
+        { _id: meeting._id, 'collaborators.user': { $ne: currentUserId } },
+        { $push: { collaborators: { user: currentUserId, role: COLLABORATOR_ROLES.VIEWER, joinedAt: new Date() } } }
+      );
+
+      // Emit socket event for real-time update
+      if (updateResult && updateResult.modifiedCount > 0) {
+        try {
+          const { emitCollaboratorJoined } = require('../services/socketService');
+          emitCollaboratorJoined('meeting', String(meeting._id), {
+            id: currentUserId,
+            name: req.user?.name || 'Anonymous',
+            image: req.user?.image || null,
+          }, COLLABORATOR_ROLES.VIEWER);
+        } catch (e) {
+          logger.warn('Failed to emit collaborator_joined after join', e);
+        }
       }
+    } catch (e) {
+      logger.warn('Failed to atomically add collaborator on join:', e?.message || e);
     }
 
     // Re-fetch populated meeting for consistent response shape
@@ -1320,9 +1629,19 @@ async function joinMeeting(req, res, next) {
     res.json({
       success: true,
       message: 'Joined meeting successfully',
-      data: { meeting: populatedMeeting }
+      data: { 
+        meeting: {
+          _id: populatedMeeting._id,
+          id: populatedMeeting._id,
+          title: populatedMeeting.title,
+        },
+        meetingId: populatedMeeting._id,
+        role: COLLABORATOR_ROLES.VIEWER,
+        alreadyMember: false,
+      }
     });
   } catch (error) {
+    logger.error('Error joining meeting:', error);
     next(error);
   }
 }
@@ -1330,10 +1649,18 @@ async function joinMeeting(req, res, next) {
 async function revokeShareLink(req, res, next) {
   try {
     const { id } = req.params;
-    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+    const meeting = await Meeting.findById(id);
 
     if (!meeting) {
       return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    // Check permission - only owner or admin can revoke share link
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(meeting, currentUserId);
+    
+    if (!permission.canShare) {
+      return res.status(403).json({ success: false, message: 'Only owners and admins can revoke share links' });
     }
 
     meeting.shareToken = undefined;
@@ -1341,42 +1668,103 @@ async function revokeShareLink(req, res, next) {
 
     res.json({ success: true, message: 'Share link revoked' });
   } catch (error) {
+    logger.error('Error revoking share link:', error);
     next(error);
   }
 }
 
 async function updateCollaboratorRole(req, res, next) {
   try {
-    const { id, userId } = req.params;
+    const { id, odellollaboratorId } = req.params;
     const { role } = req.body;
+    const collaboratorId = odellollaboratorId || req.params.userId; // Support both param names
 
-    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
-    if (!meeting) return res.status(404).json({ success: false, message: 'Meeting not found' });
+    // Validate role
+    const { isValidRole, canAssignRole } = require('../utils/permissions');
+    if (!role || !isValidRole(role) || role === COLLABORATOR_ROLES.OWNER) {
+      return res.status(400).json({ success: false, message: 'Invalid role. Allowed: admin, editor, viewer' });
+    }
 
-    const col = meeting.collaborators.find(c => c.user && c.user.toString() === userId);
-    if (!col) return res.status(404).json({ success: false, message: 'Collaborator not found' });
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
+
+    // Check permission - only owner or admin can manage collaborators
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(meeting, currentUserId);
+    
+    if (!permission.canManageCollaborators) {
+      return res.status(403).json({ success: false, message: 'Only owners and admins can update roles' });
+    }
+
+    // Check if current user can assign this role
+    if (!canAssignRole(permission.role, role)) {
+      return res.status(403).json({ success: false, message: 'You cannot assign this role level' });
+    }
+
+    const col = meeting.collaborators.find(c => c.user && idEquals(c.user, collaboratorId));
+    if (!col) {
+      return res.status(404).json({ success: false, message: 'Collaborator not found' });
+    }
 
     col.role = role;
     await meeting.save();
 
-    res.json({ success: true, message: 'Role updated' });
+    // Emit socket event
+    try {
+      const { emitCollaboratorRoleChanged } = require('../services/socketService');
+      emitCollaboratorRoleChanged('meeting', String(meeting._id), collaboratorId, role);
+    } catch (e) {
+      logger.warn('Failed to emit role change event', e);
+    }
+
+    res.json({ success: true, message: 'Role updated', data: { collaboratorId, newRole: role } });
   } catch (error) {
+    logger.error('Error updating collaborator role:', error);
     next(error);
   }
 }
 
 async function removeCollaborator(req, res, next) {
   try {
-    const { id, userId } = req.params;
-    const meeting = await Meeting.findOne({ _id: id, userId: req.user.id });
+    const { id, odellollaboratorId } = req.params;
+    const collaboratorId = odellollaboratorId || req.params.userId; // Support both param names
+    
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({ success: false, message: 'Meeting not found' });
+    }
 
-    if (!meeting) return res.status(404).json({ success: false, message: 'Meeting not found' });
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(meeting, currentUserId);
+    const isSelfRemoval = idEquals(collaboratorId, currentUserId);
 
-    meeting.collaborators = meeting.collaborators.filter(c => c.user && c.user.toString() !== userId);
+    // Allow self-removal or manager removal
+    if (!isSelfRemoval && !permission.canManageCollaborators) {
+      return res.status(403).json({ success: false, message: 'Permission denied' });
+    }
+
+    const originalLength = meeting.collaborators.length;
+    meeting.collaborators = meeting.collaborators.filter(c => !(c.user && idEquals(c.user, collaboratorId)));
+    
+    if (meeting.collaborators.length === originalLength) {
+      return res.status(404).json({ success: false, message: 'Collaborator not found' });
+    }
+
     await meeting.save();
+
+    // Emit socket event
+    try {
+      const { emitCollaboratorRemoved } = require('../services/socketService');
+      emitCollaboratorRemoved('meeting', String(meeting._id), collaboratorId);
+    } catch (e) {
+      logger.warn('Failed to emit collaborator removed event', e);
+    }
 
     res.json({ success: true, message: 'Collaborator removed' });
   } catch (error) {
+    logger.error('Error removing collaborator:', error);
     next(error);
   }
 }
