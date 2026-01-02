@@ -226,6 +226,45 @@ const emitCollaboratorRoleChanged = (resourceType, resourceId, userId, newRole) 
   }
 };
 
+// Meeting content update events (for realtime collaboration)
+const emitMeetingContentUpdated = (meetingId, updateType, data, userName) => {
+  if (io) {
+    const roomId = `meeting_${meetingId}`;
+    io.to(roomId).emit('meeting_content_updated', {
+      meetingId,
+      updateType, // 'segment_edited', 'summary_updated', 'highlights_updated', 'conclusion_updated', 'title_updated', 'description_updated'
+      data,
+      userName,
+      timestamp: new Date(),
+    });
+  }
+};
+
+// Meeting action item events
+const emitMeetingActionItemSynced = (meetingId, boardId, userName) => {
+  if (io) {
+    const roomId = `meeting_${meetingId}`;
+    io.to(roomId).emit('meeting_action_synced', {
+      meetingId,
+      boardId,
+      userName,
+      timestamp: new Date(),
+    });
+  }
+};
+
+// AI regeneration event
+const emitMeetingAiRegenerated = (meetingId, userName) => {
+  if (io) {
+    const roomId = `meeting_${meetingId}`;
+    io.to(roomId).emit('meeting_ai_regenerated', {
+      meetingId,
+      userName,
+      timestamp: new Date(),
+    });
+  }
+};
+
 module.exports = {
   initSocket,
   getIo,
@@ -234,5 +273,8 @@ module.exports = {
   emitCollaboratorJoined,
   emitCollaboratorRemoved,
   emitCollaboratorRoleChanged,
+  emitMeetingContentUpdated,
+  emitMeetingActionItemSynced,
+  emitMeetingAiRegenerated,
   getRoomUsers,
 };

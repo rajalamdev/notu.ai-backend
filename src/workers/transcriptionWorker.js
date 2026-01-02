@@ -7,15 +7,49 @@ const { MEETING_STATUS } = require('../utils/constants');
 const logger = require('../utils/logger');
 const { normalizeDate } = require('../utils/dateUtils');
 
+// Import socket service for real-time progress updates
+let emitToMeeting;
+try {
+  const socketService = require('../services/socketService');
+  emitToMeeting = socketService.emitToMeeting;
+} catch (e) {
+  logger.warn('Socket service not available for worker progress updates');
+  emitToMeeting = () => {};
+}
+
+/**
+ * Emit transcription progress to socket
+ */
+function emitProgress(meetingId, progress, message, stage) {
+  try {
+    if (emitToMeeting) {
+      emitToMeeting(meetingId, 'transcription_progress', {
+        meetingId,
+        progress,
+        message,
+        stage, // 'downloading', 'transcribing', 'diarization', 'ai_analysis', 'saving', 'completed'
+        timestamp: new Date()
+      });
+    }
+  } catch (e) {
+    logger.warn('Failed to emit progress:', e.message);
+  }
+}
+
 /**
  * Helper to add a log message to the meeting
  */
-async function addProcessingLog(meeting, message) {
+async function addProcessingLog(meeting, message, progress = null, stage = null) {
   try {
     meeting.processingLogs = meeting.processingLogs || [];
-    meeting.processingLogs.push({ message, timestamp: new Date() });
+    meeting.processingLogs.push({ message, timestamp: new Date(), progress, stage });
     await meeting.save();
     logger.info(`[Meeting ${meeting._id}] LOG: ${message}`);
+    
+    // Also emit to socket for real-time updates
+    if (progress !== null) {
+      emitProgress(String(meeting._id), progress, message, stage);
+    }
   } catch (err) {
     logger.error('Error adding processing log:', err);
   }
@@ -40,7 +74,7 @@ async function processTranscription(job) {
       throw new Error(`Meeting not found: ${meetingId}`);
     }
 
-    await addProcessingLog(meeting, 'Memulai proses transkripsi...');
+    await addProcessingLog(meeting, 'Memulai proses transkripsi...', 10, 'starting');
 
     // Check if already completed (prevent duplicate processing)
     if (meeting.status === MEETING_STATUS.COMPLETED) {
@@ -64,13 +98,13 @@ async function processTranscription(job) {
 
     // Get file from storage
     logger.info(`Retrieving file from storage: ${meeting.originalFile.filename}`);
-    await addProcessingLog(meeting, 'Mengunduh file audio dari storage...');
+    await addProcessingLog(meeting, 'Mengunduh file audio dari storage...', 20, 'downloading');
     const fileStream = await retrieveFile(meeting.originalFile.filename);
     await job.updateProgress(30);
 
     // Send to WhisperX API (removed unused diarizationMethod parameter)
     logger.info(`Sending to WhisperX API for transcription`);
-    await addProcessingLog(meeting, 'Mengirim audio ke AI service (WhisperX)...');
+    await addProcessingLog(meeting, 'Memulai transkripsi audio (WhisperX)...', 35, 'transcribing');
     const transcriptionResult = await transcribeAudio(
       fileStream,
       meeting.originalFile.originalName || meeting.originalFile.filename,
@@ -80,8 +114,13 @@ async function processTranscription(job) {
         enableSummary: true,
       }
     );
-    await addProcessingLog(meeting, 'Transkripsi & Diarization selesai. Menganalisis hasil...');
-    await job.updateProgress(90);
+    await addProcessingLog(meeting, 'Transkripsi selesai. Mengidentifikasi pembicara (Diarization)...', 70, 'diarization');
+    await job.updateProgress(75);
+    
+    await addProcessingLog(meeting, 'Diarization selesai. Menjalankan analisis AI...', 80, 'ai_analysis');
+    await job.updateProgress(85);
+
+    await addProcessingLog(meeting, 'Analisis AI selesai. Mengolah hasil...', 90, 'processing');
 
     // Transform speakers array from ["SPEAKER_0"] to [{speaker, start, end}]
     const speakersWithTimestamps = [];
@@ -196,13 +235,21 @@ async function processTranscription(job) {
     }
 
     // Save all transcription data to MongoDB
-    await addProcessingLog(meeting, 'Menyimpan hasil ke database...');
+    await addProcessingLog(meeting, 'Menyimpan hasil ke database...', 95, 'saving');
     await meeting.save();
 
     // Update status to completed
-    await addProcessingLog(meeting, 'Selesai! Semua data berhasil diproses.');
+    await addProcessingLog(meeting, '✅ Selesai! Semua data berhasil diproses.', 100, 'completed');
     await meeting.updateStatus(MEETING_STATUS.COMPLETED);
     await job.updateProgress(100);
+    
+    // Emit completion event
+    emitProgress(meetingId, 100, 'Transkripsi selesai!', 'completed');
+    try {
+      if (emitToMeeting) {
+        emitToMeeting(meetingId, 'transcription_complete', { meetingId });
+      }
+    } catch (e) {}
 
     logger.info(`Transcription completed successfully for meeting: ${meetingId}`);
     
@@ -216,11 +263,18 @@ async function processTranscription(job) {
   } catch (error) {
     logger.error(`Transcription job failed for meeting ${meetingId}:`, error);
 
+    // Emit failure event
+    try {
+      if (emitToMeeting) {
+        emitToMeeting(meetingId, 'transcription_failed', { meetingId, error: error.message });
+      }
+    } catch (e) {}
+
     // Update meeting with error
     try {
       const meeting = await Meeting.findById(meetingId);
       if (meeting) {
-        await addProcessingLog(meeting, `Error: ${error.message}`);
+        await addProcessingLog(meeting, `❌ Error: ${error.message}`, null, 'error');
         await meeting.incrementRetry();
         
         // If max retries reached, mark as failed and cleanup MinIO

@@ -111,7 +111,9 @@ const meetingSchema = new mongoose.Schema({
   },
   processingLogs: [{
     message: String,
-    timestamp: { type: Date, default: Date.now }
+    timestamp: { type: Date, default: Date.now },
+    progress: Number,
+    stage: String
   }],
   // Short summary/snippet used in list views to avoid loading full transcript
   summarySnippet: { type: String, default: '' },

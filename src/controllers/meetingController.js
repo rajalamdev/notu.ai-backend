@@ -5,6 +5,7 @@ const Board = require('../models/Board');
 const ChatMessage = require('../models/ChatMessage');
 const { removeFile, getFileUrl } = require('../services/storageService');
 const { getJobStatus } = require('../services/queueService');
+const { emitToMeeting, emitMeetingContentUpdated, emitMeetingActionItemSynced, emitMeetingAiRegenerated } = require('../services/socketService');
 const crypto = require('crypto');
 const nanoid = (size = 10) => crypto.randomBytes(size).toString('hex').slice(0, size);
 const { MEETING_STATUS, MEETING_TYPE, PLATFORM, COLLABORATOR_ROLES } = require('../utils/constants');
@@ -164,7 +165,7 @@ async function getAllMeetings(req, res, next) {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .select('title suggestedTitle type transcription.summary description tags createdAt updatedAt userId isPublic collaborators'); // small projection for list view (include type)
+      .select('title suggestedTitle type status platform transcription.summary description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants summarySnippet'); // include status, platform, logs for status page
 
     const total = await Meeting.countDocuments(query);
 
@@ -201,10 +202,17 @@ async function getAllMeetings(req, res, next) {
       const actionCount = actionMap.get(String(obj._id)) || 0;
       const hasBoard = (boardMap.get(String(obj._id)) || 0) > 0;
 
+      // Get latest progress from logs
+      const latestLog = obj.processingLogs && obj.processingLogs.length > 0 
+        ? obj.processingLogs[obj.processingLogs.length - 1] 
+        : null;
+
       return {
         _id: obj._id,
         title,
         type: obj.type || 'upload',
+        status: obj.status || 'pending',
+        platform: obj.platform || 'Upload',
         description: obj.description || '',
         tags: obj.tags || [],
         createdAt: obj.createdAt,
@@ -219,6 +227,12 @@ async function getAllMeetings(req, res, next) {
         canManageCollaborators: permission.canManageCollaborators,
         actionItemCount: actionCount,
         hasBoard,
+        duration: obj.duration || 0,
+        participants: obj.participants || 0,
+        summarySnippet,
+        processingLogs: obj.processingLogs || [],
+        processingProgress: latestLog?.progress || 0,
+        processingStage: latestLog?.stage || null,
       };
     });
 
@@ -392,7 +406,37 @@ async function getMeetingById(req, res, next) {
       logger.warn('Failed to backfill collaborator user info:', e?.message || e);
     }
 
+    // Build unified participants array: owner first, then collaborators sorted by joinedAt
+    const ownerInfo = meetingObj.userId || {};
+    const ownerParticipant = {
+      user: {
+        _id: ownerInfo._id ? String(ownerInfo._id) : rawUserId,
+        name: ownerInfo.name || 'Original Owner',
+        email: ownerInfo.email || null,
+        image: ownerInfo.image || null,
+      },
+      role: COLLABORATOR_ROLES.OWNER,
+      joinedAt: meetingObj.createdAt || null,
+      isOwner: true,
+    };
+
+    // Map collaborators (excluding any duplicate owner entries)
+    const collaboratorParticipants = finalCollaborators
+      .filter(c => c.user && String(c.user._id) !== String(ownerParticipant.user._id))
+      .map(c => ({
+        user: c.user,
+        role: c.role,
+        joinedAt: c.joinedAt,
+        isOwner: false,
+      }))
+      .sort((a, b) => new Date(a.joinedAt || 0).getTime() - new Date(b.joinedAt || 0).getTime());
+
+    // Combine: owner first, then collaborators sorted by joinedAt
+    const participants = [ownerParticipant, ...collaboratorParticipants];
+
+    // Keep collaborators for backward compatibility but also add participants
     meetingObj.collaborators = finalCollaborators;
+    meetingObj.participants = participants;
 
     // 4. Overwrite/Harmonize Meta-data
     // Move suggested values into main fields if missing (already Done in worker/controller but just in case)
@@ -414,6 +458,9 @@ async function getMeetingById(req, res, next) {
       unifiedActionItems = unifiedActionItems.map(item => ({ ...item, boardId: boardIdStr }));
     }
 
+    // Get permission for response (to include in meeting object)
+    const permission = getResourcePermission(meetingObj, currentUserId);
+
     res.json({
       success: true,
       meeting: {
@@ -422,6 +469,13 @@ async function getMeetingById(req, res, next) {
         hasBoard,
         userRole,
         fileUrl,
+        // Only include shareToken if user has share permission
+        shareToken: permission.canShare ? meeting.shareToken : undefined,
+        // Include permission flags for frontend
+        canEdit: permission.canEdit,
+        canDelete: permission.canDelete,
+        canShare: permission.canShare,
+        canManageCollaborators: permission.canManageCollaborators,
       },
       analytics,
       actionItems: unifiedActionItems,
@@ -456,7 +510,7 @@ async function getMeetingStatus(req, res, next) {
   try {
     const { id } = req.params;
 
-    const meeting = await Meeting.findById(id).select('status errorMessage retryCount processingLogs');
+    const meeting = await Meeting.findById(id).select('status errorMessage retryCount processingLogs processingMeta');
 
     if (!meeting) {
       return res.status(404).json({
@@ -470,6 +524,11 @@ async function getMeetingStatus(req, res, next) {
     const jobId = `transcription-${id}`;
     const jobStatus = await getJobStatus(jobId);
 
+    // Get latest stage and progress from logs
+    const latestLog = meeting.processingLogs && meeting.processingLogs.length > 0 
+      ? meeting.processingLogs[meeting.processingLogs.length - 1] 
+      : null;
+
     res.json({
       success: true,
       data: {
@@ -477,6 +536,9 @@ async function getMeetingStatus(req, res, next) {
         status: meeting.status,
         errorMessage: meeting.errorMessage,
         retryCount: meeting.retryCount,
+        processingLogs: meeting.processingLogs || [],
+        processingStage: latestLog?.stage || null,
+        processingProgress: latestLog?.progress || jobStatus?.progress || 0,
         job: jobStatus,
       },
     });
@@ -505,13 +567,11 @@ async function updateMeeting(req, res, next) {
       });
     }
 
-    // Access check: Only owner or editor can update
+    // Access check: Only owner, admin, or editor can update
     const currentUserId = req.user?.id || req.user?._id;
-    const hasOwnerRole = meeting.collaborators && Array.isArray(meeting.collaborators) && meeting.collaborators.some(c => c && c.role === COLLABORATOR_ROLES.OWNER && currentUserId && idEquals(c.user, currentUserId));
-    const isOwner = !!(currentUserId && (idEquals(meeting.userId, currentUserId) || hasOwnerRole));
-    const isEditor = meeting.collaborators && meeting.collaborators.some(c => c && c.role === 'editor' && currentUserId && idEquals(c.user, currentUserId));
+    const permission = getResourcePermission(meeting, currentUserId);
 
-    if (!isOwner && !isEditor) {
+    if (!permission.canEdit) {
       return res.status(403).json({
         success: false,
         error: 'Forbidden',
@@ -560,6 +620,24 @@ async function updateMeeting(req, res, next) {
       updateData,
       { new: true, runValidators: true }
     );
+
+    // Emit socket event for realtime updates
+    const userName = req.user?.name || 'Unknown';
+    const updateTypes = [];
+    if (updates.title !== undefined) updateTypes.push('title_updated');
+    if (updates.description !== undefined) updateTypes.push('description_updated');
+    if (updates.executiveSummary !== undefined) updateTypes.push('summary_updated');
+    if (updates.highlights !== undefined) updateTypes.push('highlights_updated');
+    if (updates.conclusion !== undefined) updateTypes.push('conclusion_updated');
+    if (updates.tags !== undefined) updateTypes.push('tags_updated');
+    
+    // Only emit ONE event: meeting_updated with all the update info
+    emitToMeeting(id, 'meeting_updated', { 
+      meeting: updatedMeeting, 
+      updatedBy: { _id: currentUserId, name: userName },
+      field: updateTypes[0]?.replace('_updated', '') || 'content',
+      updateTypes // Include all update types for debugging
+    });
 
     res.json({
       success: true,
@@ -750,7 +828,75 @@ async function exportTranscript(req, res, next) {
       });
     }
 
-    // Format transcript
+    // Helper function to format time for SRT (HH:MM:SS,mmm)
+    const formatTimeSRT = (seconds) => {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      const ms = Math.floor((seconds % 1) * 1000);
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`;
+    };
+
+    // Helper function to format time for VTT (HH:MM:SS.mmm)
+    const formatTimeVTT = (seconds) => {
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      const ms = Math.floor((seconds % 1) * 1000);
+      return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+    };
+
+    // Handle SRT format
+    if (format === 'srt') {
+      let srt = '';
+      if (meeting.transcription.segments && meeting.transcription.segments.length > 0) {
+        meeting.transcription.segments.forEach((segment, index) => {
+          srt += `${index + 1}\n`;
+          srt += `${formatTimeSRT(segment.start)} --> ${formatTimeSRT(segment.end)}\n`;
+          srt += `${segment.speaker}: ${segment.text}\n\n`;
+        });
+      }
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${meeting.title || 'transcript'}.srt"`);
+      return res.send(srt);
+    }
+
+    // Handle VTT format
+    if (format === 'vtt') {
+      let vtt = 'WEBVTT\n\n';
+      if (meeting.transcription.segments && meeting.transcription.segments.length > 0) {
+        meeting.transcription.segments.forEach((segment, index) => {
+          vtt += `${index + 1}\n`;
+          vtt += `${formatTimeVTT(segment.start)} --> ${formatTimeVTT(segment.end)}\n`;
+          vtt += `<v ${segment.speaker}>${segment.text}\n\n`;
+        });
+      }
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${meeting.title || 'transcript'}.vtt"`);
+      return res.send(vtt);
+    }
+
+    // Handle JSON format
+    if (format === 'json') {
+      const jsonData = {
+        meeting: {
+          _id: meeting._id,
+          title: meeting.title,
+          description: meeting.description,
+          createdAt: meeting.createdAt,
+          duration: meeting.duration,
+          platform: meeting.platform,
+          type: meeting.type,
+        },
+        transcription: meeting.transcription,
+        actionItems: meeting.actionItems,
+      };
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${meeting.title || 'meeting'}.json"`);
+      return res.send(JSON.stringify(jsonData, null, 2));
+    }
+
+    // Format transcript (default TXT format)
     let transcript = `Meeting: ${meeting.title}\n`;
     transcript += `Date: ${meeting.createdAt.toLocaleDateString()}\n`;
     if (meeting.description) {
@@ -947,6 +1093,10 @@ async function regenerateMetadata(req, res, next) {
     await addProcessingLog(meeting, 'Analisis AI berhasil diperbarui.');
     await meeting.save();
 
+    // Emit socket event for realtime updates
+    const userName = req.user?.name || 'Unknown';
+    emitMeetingAiRegenerated(id, userName);
+
     // Harmonize response (same as in getMeetingById)
     const meetingObj = meeting.toObject();
     delete meetingObj.suggestedTitle;
@@ -1032,6 +1182,16 @@ async function updateSpeakerName(req, res, next) {
       meeting.markModified('transcription.segments');
       meeting.markModified('transcription.speakers');
       await meeting.save();
+
+      // Emit socket event for realtime updates
+      const userName = req.user?.name || 'Unknown';
+      emitMeetingContentUpdated(id, 'segment_edited', { 
+        oldSpeakerName, 
+        newSpeakerName, 
+        segmentIndex, 
+        applyToAll,
+        updatedCount 
+      }, userName);
     }
 
     res.json({
@@ -1073,18 +1233,28 @@ async function askAI(req, res, next) {
       return res.status(403).json({ success: false, message: 'Access denied' });
     }
 
-    // Save user's question to chat history
-    const userMessage = await ChatMessage.addMessage(id, userId, 'user', question.trim());
-
     // Build context from meeting data
     const meetingContext = buildMeetingContext(meeting);
     
     // Get recent chat history for context (last 10 messages)
-    const chatHistory = await ChatMessage.find({ meetingId: id })
-      .sort({ createdAt: -1 })
-      .limit(10)
-      .lean();
-    chatHistory.reverse(); // Oldest first
+    let chatHistory = [];
+    try {
+      chatHistory = await ChatMessage.find({ meetingId: id })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean();
+      chatHistory.reverse(); // Oldest first
+    } catch (chatErr) {
+      logger.warn('Could not fetch chat history:', chatErr.message);
+    }
+
+    // Save user's question to chat history (non-blocking)
+    let userMessage = null;
+    try {
+      userMessage = await ChatMessage.addMessage(id, userId, 'user', question.trim());
+    } catch (saveErr) {
+      logger.warn('Could not save user message:', saveErr.message);
+    }
 
     // Call LLM service
     const startTime = Date.now();
@@ -1092,12 +1262,16 @@ async function askAI(req, res, next) {
     try {
       aiResponse = await callLLMForQuestion(meetingContext, chatHistory, question.trim());
     } catch (llmError) {
-      logger.error('LLM service error:', llmError);
-      // Save error message
-      await ChatMessage.addMessage(id, null, 'assistant', 
-        'Maaf, terjadi kesalahan saat memproses pertanyaan Anda. Silakan coba lagi.',
-        { error: llmError.message }
-      );
+      logger.error('LLM service error:', llmError.message);
+      
+      // Try saving error message (non-blocking)
+      try {
+        await ChatMessage.addMessage(id, null, 'assistant', 
+          'Maaf, terjadi kesalahan saat memproses pertanyaan Anda. Silakan coba lagi.',
+          { error: llmError.message }
+        );
+      } catch (e) { /* ignore */ }
+      
       return res.status(500).json({
         success: false,
         message: 'Failed to process question',
@@ -1106,24 +1280,33 @@ async function askAI(req, res, next) {
     }
     const responseTime = Date.now() - startTime;
 
-    // Save AI response to chat history
-    const assistantMessage = await ChatMessage.addMessage(id, null, 'assistant', aiResponse, {
-      responseTime,
-      model: process.env.LLM_MODEL || 'google/gemma-3-4b-it:free',
-    });
+    // Save AI response to chat history (non-blocking)
+    let assistantMessage = { content: aiResponse, _id: null };
+    try {
+      assistantMessage = await ChatMessage.addMessage(id, null, 'assistant', aiResponse, {
+        responseTime,
+        model: process.env.LLM_MODEL || 'google/gemma-3-4b-it:free',
+      });
+    } catch (saveErr) {
+      logger.warn('Could not save assistant message:', saveErr.message);
+    }
 
     res.json({
       success: true,
       data: {
-        question: userMessage.content,
-        answer: assistantMessage.content,
-        messageId: assistantMessage._id,
+        question: question.trim(),
+        answer: aiResponse,
+        messageId: assistantMessage?._id || null,
         responseTime,
       },
     });
   } catch (error) {
     logger.error('Ask AI error:', error);
-    next(error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
   }
 }
 
@@ -1194,65 +1377,121 @@ async function clearChatHistory(req, res, next) {
  * Build meeting context for LLM
  */
 function buildMeetingContext(meeting) {
-  let context = `# Meeting: ${meeting.title}\n\n`;
+  let context = `# Meeting: ${meeting.title || 'Untitled Meeting'}\n\n`;
   
   if (meeting.description) {
-    context += `## Description\n${meeting.description}\n\n`;
+    context += `## Deskripsi\n${meeting.description}\n\n`;
   }
 
-  if (meeting.aiNotes) {
-    if (meeting.aiNotes.summary) {
-      context += `## Summary\n${meeting.aiNotes.summary}\n\n`;
+  // Meeting metadata
+  if (meeting.createdAt) {
+    context += `**Tanggal:** ${new Date(meeting.createdAt).toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}\n`;
+  }
+  if (meeting.duration) {
+    const mins = Math.floor(meeting.duration / 60);
+    context += `**Durasi:** ${mins} menit\n`;
+  }
+  if (meeting.tags && meeting.tags.length > 0) {
+    context += `**Topik:** ${meeting.tags.join(', ')}\n`;
+  }
+  context += '\n';
+
+  // Use transcription object (correct structure)
+  const transcription = meeting.transcription || {};
+
+  if (transcription.summary) {
+    context += `## Ringkasan\n${transcription.summary}\n\n`;
+  }
+
+  if (transcription.highlights && typeof transcription.highlights === 'object') {
+    context += `## Poin-Poin Penting\n`;
+    for (const [topic, content] of Object.entries(transcription.highlights)) {
+      context += `### ${topic}\n${content}\n\n`;
     }
-    if (meeting.aiNotes.highlights && typeof meeting.aiNotes.highlights === 'object') {
-      context += `## Key Points\n`;
-      for (const [topic, content] of Object.entries(meeting.aiNotes.highlights)) {
-        context += `### ${topic}\n${content}\n\n`;
-      }
-    }
-    if (meeting.aiNotes.conclusion) {
-      context += `## Conclusion\n${meeting.aiNotes.conclusion}\n\n`;
-    }
-    if (meeting.aiNotes.actionItems && meeting.aiNotes.actionItems.length > 0) {
-      context += `## Action Items\n`;
-      meeting.aiNotes.actionItems.forEach((item, i) => {
-        context += `${i + 1}. ${item.title}${item.description ? ': ' + item.description : ''}\n`;
-      });
+  }
+
+  if (transcription.conclusion) {
+    context += `## Kesimpulan\n${transcription.conclusion}\n\n`;
+  }
+
+  // Include action items from meeting.actionItems (AI candidates)
+  const actionItems = meeting.actionItems || [];
+  if (actionItems.length > 0) {
+    context += `## Action Items / Tugas\n`;
+    actionItems.forEach((item, i) => {
+      context += `${i + 1}. **${item.title}**`;
+      if (item.description) context += `: ${item.description}`;
+      if (item.priority) context += ` (Prioritas: ${item.priority})`;
+      if (item.dueDate) context += ` - Deadline: ${item.dueDate}`;
       context += '\n';
-    }
+    });
+    context += '\n';
   }
 
-  if (meeting.transcription && meeting.transcription.segments) {
-    context += `## Transcript Excerpts\n`;
-    // Include first 50 segments as context (to avoid token limits)
-    const segments = meeting.transcription.segments.slice(0, 50);
+  // Include full transcript with speakers for better Q&A context
+  if (transcription.segments && transcription.segments.length > 0) {
+    context += `## Transkrip Lengkap\n`;
+    // Include all segments for comprehensive context (up to 200 to avoid excessive tokens)
+    const segments = transcription.segments.slice(0, 200);
     segments.forEach(seg => {
       const speaker = seg.speaker || 'Speaker';
-      context += `[${speaker}]: ${seg.text}\n`;
+      const timestamp = seg.start ? `[${formatSeconds(seg.start)}]` : '';
+      context += `${timestamp} **${speaker}**: ${seg.text}\n`;
     });
+    
+    if (transcription.segments.length > 200) {
+      context += `\n... (${transcription.segments.length - 200} segmen lainnya tidak ditampilkan)\n`;
+    }
   }
 
   return context;
 }
 
 /**
+ * Format seconds to MM:SS or HH:MM:SS
+ */
+function formatSeconds(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+/**
  * Call LLM service for question answering
  */
 async function callLLMForQuestion(meetingContext, chatHistory, question) {
-  const WHISPER_URL = config.FASTER_WHISPER_URL || 'http://localhost:8000';
+  const WHISPER_URL = config.WHISPERX_API_URL || 'http://localhost:5005';
   
   // Build messages array for chat completion
   const messages = [
     {
       role: 'system',
-      content: `Kamu adalah asisten AI yang membantu menjawab pertanyaan tentang notulensi rapat.
-Berdasarkan konteks rapat yang diberikan, jawab pertanyaan user dengan jelas dan ringkas.
-Jika informasi tidak tersedia dalam konteks, katakan dengan jujur bahwa informasi tersebut tidak ada dalam notulensi.
-Jawab dalam bahasa Indonesia.`
+      content: `Kamu adalah asisten AI cerdas yang membantu menjawab pertanyaan tentang notulensi rapat.
+
+KEMAMPUANMU:
+- Menjawab pertanyaan tentang isi rapat (siapa bilang apa, keputusan apa yang diambil, dll)
+- Meringkas bagian tertentu dari rapat
+- Mencari informasi spesifik dari transkrip
+- Menjelaskan konteks dan hubungan antar topik yang dibahas
+- Mengidentifikasi tugas dan action items
+- Menganalisis sentimen dan dinamika diskusi
+
+PANDUAN MENJAWAB:
+1. Jawab dengan jelas, ringkas, dan terstruktur
+2. Jika ada kutipan relevan dari transkrip, sertakan dengan menyebut pembicara
+3. Jika informasi tidak ada dalam konteks rapat, katakan dengan jujur
+4. Gunakan format markdown untuk memperjelas (bold, bullet points, dll)
+5. Jawab dalam bahasa Indonesia
+
+Konteks rapat di bawah ini berisi ringkasan, poin-poin penting, kesimpulan, action items, dan transkrip lengkap.`
     },
     {
       role: 'user',
-      content: `Konteks Rapat:\n${meetingContext}`
+      content: `Berikut adalah konteks lengkap rapat:\n\n${meetingContext}`
     }
   ];
 
@@ -1275,18 +1514,50 @@ Jawab dalam bahasa Indonesia.`
       max_tokens: 1000,
     }, {
       timeout: 60000,
+      validateStatus: () => true, // Don't throw on non-2xx status
     });
 
-    if (response.data && response.data.response) {
+    // Check if faster-whisper returned success
+    if (response.data?.success && response.data?.response) {
       return response.data.response;
     }
-    throw new Error('Invalid LLM response');
-  } catch (error) {
-    // Fallback: Try direct OpenRouter if faster-whisper endpoint fails
+    
+    // If faster-whisper returned error, log and try fallback
+    const errorMsg = response.data?.error || response.data?.response || `HTTP ${response.status}: ${response.statusText}`;
+    logger.warn(`Faster-whisper chat error (${WHISPER_URL}): ${errorMsg}, trying fallback...`);
+    
+    // Fallback: Try direct OpenRouter
     if (process.env.OPENROUTER_API_KEY) {
+      logger.info('Trying OpenRouter direct fallback...');
       return await callOpenRouterDirect(messages);
     }
-    throw error;
+    
+    throw new Error(`Faster-whisper error: ${errorMsg}. OpenRouter API key not configured.`);
+  } catch (error) {
+    logger.error('Error calling LLM service:', {
+      message: error.message,
+      code: error.code,
+      url: `${WHISPER_URL}/api/chat`,
+      hasOpenRouterKey: !!process.env.OPENROUTER_API_KEY
+    });
+    
+    // Fallback: Try direct OpenRouter if faster-whisper endpoint fails
+    if (process.env.OPENROUTER_API_KEY) {
+      logger.info('Trying OpenRouter fallback after connection error...');
+      try {
+        return await callOpenRouterDirect(messages);
+      } catch (fallbackError) {
+        logger.error('OpenRouter fallback also failed:', fallbackError.message);
+        throw new Error(`LLM service unavailable. Faster-whisper: ${error.message}. OpenRouter: ${fallbackError.message}`);
+      }
+    }
+    
+    // No fallback available
+    if (error.code === 'ECONNREFUSED') {
+      throw new Error(`Faster-whisper service is not running at ${WHISPER_URL}. Please start the service or configure OPENROUTER_API_KEY.`);
+    }
+    
+    throw new Error(`LLM service error: ${error.message}. Please configure OPENROUTER_API_KEY as fallback.`);
   }
 }
 
@@ -1294,21 +1565,35 @@ Jawab dalam bahasa Indonesia.`
  * Direct OpenRouter call as fallback
  */
 async function callOpenRouterDirect(messages) {
-  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-    model: process.env.LLM_MODEL || 'google/gemma-3-4b-it:free',
-    messages,
-  }, {
-    headers: {
-      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 60000,
-  });
+  try {
+    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model: process.env.LLM_MODEL || 'google/gemma-3-4b-it:free',
+      messages,
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 60000,
+      validateStatus: () => true,
+    });
 
-  if (response.data?.choices?.[0]?.message?.content) {
-    return response.data.choices[0].message.content;
+    if (response.status !== 200) {
+      const errorMsg = response.data?.error?.message || response.data?.error || `HTTP ${response.status}`;
+      throw new Error(`OpenRouter API error: ${errorMsg}`);
+    }
+
+    if (response.data?.choices?.[0]?.message?.content) {
+      return response.data.choices[0].message.content;
+    }
+    
+    throw new Error('OpenRouter returned empty response');
+  } catch (error) {
+    if (error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN') {
+      throw new Error('Cannot connect to OpenRouter API. Check your internet connection.');
+    }
+    throw error;
   }
-  throw new Error('Invalid OpenRouter response');
 }
 
 module.exports = {
