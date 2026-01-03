@@ -13,9 +13,22 @@ module.exports = {
   // Meeting status
   MEETING_STATUS: {
     PENDING: 'pending',
+    QUEUED: 'queued',
     PROCESSING: 'processing',
     COMPLETED: 'completed',
     FAILED: 'failed',
+  },
+
+  // Progress weights for stage-based progress (no time estimation)
+  // Ranges are NON-OVERLAPPING: each stage ends just before next starts
+  PROGRESS_WEIGHTS: {
+    starting: { start: 0, end: 9 },
+    downloading: { start: 10, end: 19 },
+    transcribing: { start: 20, end: 69 },
+    diarization: { start: 70, end: 79 },
+    ai_analysis: { start: 80, end: 89 },
+    saving: { start: 90, end: 99 },
+    completed: { start: 100, end: 100 },
   },
 
   // Meeting types

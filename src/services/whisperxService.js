@@ -4,6 +4,7 @@ const fs = require('fs');
 const config = require('../config/env');
 const logger = require('../utils/logger');
 const { WHISPERX_DEFAULTS } = require('../utils/constants');
+const EventSource = require('eventsource');
 
 /**
  * Validate WhisperX API response
@@ -81,6 +82,12 @@ async function transcribeAudio(fileStream, filename, meetingId, options = {}) {
     // Validate response before returning
     validateWhisperXResponse(response.data);
 
+    // Log chunking metadata if present
+    if (response.data.metadata?.chunking) {
+      const chunking = response.data.metadata.chunking;
+      logger.info(`Chunking used: ${chunking.chunking_used}, Chunks: ${chunking.total_chunks || 1}`);
+    }
+
     return {
       ...response.data,
       processingTime,
@@ -93,6 +100,114 @@ async function transcribeAudio(fileStream, filename, meetingId, options = {}) {
     }
     throw new Error(`WhisperX API connection error: ${error.message}`);
   }
+}
+
+/**
+ * Transcribe audio with streaming progress updates via SSE
+ * @param {Buffer} fileBuffer - The audio file buffer
+ * @param {string} filename - Original filename
+ * @param {string} meetingId - Meeting ID for tracking
+ * @param {Object} options - Transcription options
+ * @param {Function} onProgress - Progress callback (stage, progress, message, data)
+ * @returns {Promise<Object>} Transcription result
+ */
+async function transcribeAudioWithProgress(fileBuffer, filename, meetingId, options = {}, onProgress = null) {
+  const {
+    numSpeakers = WHISPERX_DEFAULTS.NUM_SPEAKERS,
+    language = null,
+  } = options;
+
+  const startTime = Date.now();
+
+  return new Promise((resolve, reject) => {
+    // Create form data for file upload
+    const formData = new FormData();
+    formData.append('file', fileBuffer, { filename });
+    formData.append('meeting_id', meetingId);
+    formData.append('num_speakers', numSpeakers.toString());
+    if (language) {
+      formData.append('language', language);
+    }
+
+    logger.info(`Starting streaming transcription for: ${filename}, Meeting ID: ${meetingId}`);
+
+    // Post file and get SSE stream
+    axios.post(
+      `${config.WHISPERX_API_URL}/transcribe/stream`,
+      formData,
+      {
+        headers: formData.getHeaders(),
+        responseType: 'stream',
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        timeout: 1800000, // 30 minutes
+      }
+    ).then(response => {
+      let result = null;
+      let buffer = '';
+
+      response.data.on('data', (chunk) => {
+        buffer += chunk.toString();
+        
+        // Process complete SSE messages
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop(); // Keep incomplete message in buffer
+        
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              
+              // Log every event received for debugging
+              logger.info(`[SSE] Received: type=${data.type}, stage=${data.stage || 'N/A'}, progress=${data.progress || 'N/A'}`);
+              
+              if (data.type === 'progress' && onProgress) {
+                // Forward ALL progress events to frontend
+                onProgress(data.stage, data.progress, data.message, {
+                  chunk: data.chunk,
+                  totalChunks: data.total_chunks,
+                });
+              } else if (data.type === 'transcript_chunk') {
+                // Don't emit progress for transcript chunks - just log
+                logger.debug(`Received transcript chunk ${data.chunk_index}`);
+              } else if (data.type === 'complete') {
+                result = data;
+                logger.info('[SSE] Received complete result');
+                // NOTE: Removed duplicate completed emission - Python SSE already sends stage=completed with progress=100
+              } else if (data.type === 'error') {
+                throw new Error(data.error);
+              }
+            } catch (parseError) {
+              logger.warn('Failed to parse SSE message:', parseError.message);
+            }
+          }
+        }
+      });
+
+      response.data.on('end', () => {
+        const processingTime = Math.floor((Date.now() - startTime) / 1000);
+        
+        if (result) {
+          logger.info(`Streaming transcription completed in ${processingTime}s`);
+          resolve({
+            ...result,
+            processingTime,
+          });
+        } else {
+          reject(new Error('No result received from streaming transcription'));
+        }
+      });
+
+      response.data.on('error', (error) => {
+        logger.error('SSE stream error:', error);
+        reject(error);
+      });
+
+    }).catch(error => {
+      logger.error('Streaming transcription request failed:', error.message);
+      reject(error);
+    });
+  });
 }
 
 /**
@@ -179,6 +294,7 @@ async function analyzeTranscript(transcript) {
 
 module.exports = {
   transcribeAudio,
+  transcribeAudioWithProgress,
   analyzeTranscript,
   checkHealth,
 };

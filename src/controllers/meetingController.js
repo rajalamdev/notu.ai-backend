@@ -165,7 +165,7 @@ async function getAllMeetings(req, res, next) {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .select('title suggestedTitle type status platform transcription.summary description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants summarySnippet'); // include status, platform, logs for status page
+      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile'); // include status, platform, logs for status page
 
     const total = await Meeting.countDocuments(query);
 
@@ -195,9 +195,6 @@ async function getAllMeetings(req, res, next) {
       
       // Use centralized permission helper for consistent role detection
       const permission = getResourcePermission(obj, currentUserId);
-
-      // Provide a lightweight summary for list previews (use transcription.summary only)
-      const summarySnippet = obj.transcription && obj.transcription.summary ? String(obj.transcription.summary).slice(0, 200) : '';
 
       const actionCount = actionMap.get(String(obj._id)) || 0;
       const hasBoard = (boardMap.get(String(obj._id)) || 0) > 0;
@@ -229,7 +226,7 @@ async function getAllMeetings(req, res, next) {
         hasBoard,
         duration: obj.duration || 0,
         participants: obj.participants || 0,
-        summarySnippet,
+        originalFilename: obj.originalFile?.originalName || '',
         processingLogs: obj.processingLogs || [],
         processingProgress: latestLog?.progress || 0,
         processingStage: latestLog?.stage || null,

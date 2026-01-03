@@ -182,9 +182,16 @@ const emitToBoard = (boardId, event, data) => {
 };
 
 // Helper to emit meeting-scoped events
+// NOTE: transcription_progress is broadcast globally so status-meeting page doesn't need room joins
 const emitToMeeting = (meetingId, event, data) => {
   if (io) {
-    io.to(`meeting_${meetingId}`).emit(event, data);
+    if (event === 'transcription_progress' || event === 'worker_heartbeat') {
+      // Broadcast globally for progress events - status page monitors multiple meetings
+      io.emit(event, { ...data, meetingId });
+    } else {
+      // Other events stay room-scoped
+      io.to(`meeting_${meetingId}`).emit(event, data);
+    }
   }
 };
 

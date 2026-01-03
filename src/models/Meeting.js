@@ -108,6 +108,13 @@ const meetingSchema = new mongoose.Schema({
     queuedAt: Date,
     processingStartedAt: Date,
     lastUpdatedAt: Date,
+    lastHeartbeat: Date,  // For detecting hung workers
+    currentStage: String, // Current processing stage
+    chunkInfo: {          // For chunked transcription
+      currentChunk: Number,
+      totalChunks: Number,
+      chunkingEnabled: Boolean,
+    },
   },
   processingLogs: [{
     message: String,
