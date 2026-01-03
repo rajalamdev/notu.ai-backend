@@ -94,23 +94,28 @@ function startHeartbeat(meetingId, initialStage) {
  */
 async function addProcessingLog(meeting, message, progress = null, stage = null, extra = {}) {
   try {
-    meeting.processingLogs = meeting.processingLogs || [];
-    meeting.processingLogs.push({ message, timestamp: new Date(), progress, stage });
+    const meetingId = meeting._id;
     
-    // Update processing meta
-    meeting.processingMeta = meeting.processingMeta || {};
-    meeting.processingMeta.lastUpdatedAt = new Date();
+    // Use atomic update to avoid parallel save conflicts
+    const updateObj = {
+      $push: {
+        processingLogs: { message, timestamp: new Date(), progress, stage }
+      },
+      $set: {
+        'processingMeta.lastUpdatedAt': new Date(),
+      }
+    };
+    
     if (stage) {
-      meeting.processingMeta.currentStage = stage;
+      updateObj.$set['processingMeta.currentStage'] = stage;
     }
     
-    // Save first (atomic operation)
-    await meeting.save();
-    logger.info(`[Meeting ${meeting._id}] LOG: ${message}`);
+    await Meeting.findByIdAndUpdate(meetingId, updateObj);
+    logger.info(`[Meeting ${meetingId}] LOG: ${message}`);
     
     // Then emit to socket (after save succeeds)
     if (progress !== null) {
-      emitProgress(String(meeting._id), progress, message, stage, extra);
+      emitProgress(String(meetingId), progress, message, stage, extra);
     }
   } catch (err) {
     logger.error('Error adding processing log:', err);

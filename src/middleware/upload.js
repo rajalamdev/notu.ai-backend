@@ -50,6 +50,29 @@ const upload = multer({
   },
 });
 
+// Memory storage for realtime audio (to upload directly to MinIO)
+const realtimeStorage = multer.memoryStorage();
+
+// Realtime audio file filter (accepts webm, wav, mp3)
+const realtimeFileFilter = (req, file, cb) => {
+  const allowedMimes = ['audio/webm', 'audio/wav', 'audio/mpeg', 'audio/mp3', 'audio/ogg', 'video/webm'];
+  if (allowedMimes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    logger.warn(`Invalid realtime audio upload: ${file.originalname} (${file.mimetype})`);
+    cb(new Error(`Invalid audio type. Allowed: webm, wav, mp3, ogg`), false);
+  }
+};
+
+// Realtime audio upload config
+const realtimeUpload = multer({
+  storage: realtimeStorage,
+  fileFilter: realtimeFileFilter,
+  limits: {
+    fileSize: 200 * 1024 * 1024, // 200MB for long recordings
+  },
+});
+
 // Error handling middleware for multer
 const handleMulterError = (err, req, res, next) => {
   if (err instanceof multer.MulterError) {
@@ -87,5 +110,6 @@ const handleMulterError = (err, req, res, next) => {
 
 module.exports = {
   upload,
+  realtimeUpload,
   handleMulterError,
 };

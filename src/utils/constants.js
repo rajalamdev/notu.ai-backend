@@ -44,6 +44,8 @@ module.exports = {
     UPLOAD: 'Upload',
     ZOOM: 'Zoom',
     TEAMS: 'Microsoft Teams',
+    MICROPHONE: 'Microphone',
+    OTHER: 'Other',
   },
 
   // Job queue names

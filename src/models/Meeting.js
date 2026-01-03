@@ -127,6 +127,12 @@ const meetingSchema = new mongoose.Schema({
   // Soft-delete flag
   deleted: { type: Boolean, default: false },
   
+  // Pinned to sidebar - per-user (max 3 per user enforced in controller)
+  pinnedBy: [{
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    pinnedAt: { type: Date, default: Date.now },
+  }],
+  
 }, {
   timestamps: true, // Adds createdAt and updatedAt
 });

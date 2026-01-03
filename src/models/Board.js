@@ -27,7 +27,12 @@ const boardSchema = new mongoose.Schema({
   },
   shareToken: { type: String, unique: true, sparse: true },
   collaborators: [collaboratorSchema],
-  labels: [labelSchema]
+  labels: [labelSchema],
+  // Pinned to sidebar - per-user (max 3 per user enforced in controller)
+  pinnedBy: [{
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    pinnedAt: { type: Date, default: Date.now },
+  }],
 }, {
   timestamps: true,
 });

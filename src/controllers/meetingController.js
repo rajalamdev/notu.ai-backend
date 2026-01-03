@@ -165,7 +165,7 @@ async function getAllMeetings(req, res, next) {
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
-      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile'); // include status, platform, logs for status page
+      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile shareToken pinnedBy'); // include status, platform, logs for status page
 
     const total = await Meeting.countDocuments(query);
 
@@ -204,6 +204,14 @@ async function getAllMeetings(req, res, next) {
         ? obj.processingLogs[obj.processingLogs.length - 1] 
         : null;
 
+      // Check if user has pinned this meeting
+      const isPinned = currentUserId && obj.pinnedBy && Array.isArray(obj.pinnedBy) 
+        ? obj.pinnedBy.some(p => p.user && p.user.toString() === currentUserId.toString())
+        : false;
+
+      // Only include shareToken for owner/admin
+      const canShare = permission.isOwner || permission.role === 'admin';
+
       return {
         _id: obj._id,
         title,
@@ -230,6 +238,8 @@ async function getAllMeetings(req, res, next) {
         processingLogs: obj.processingLogs || [],
         processingProgress: latestLog?.progress || 0,
         processingStage: latestLog?.stage || null,
+        pinned: isPinned,
+        ...(canShare && obj.shareToken ? { shareToken: obj.shareToken } : {}),
       };
     });
 
@@ -1602,6 +1612,7 @@ module.exports = {
   exportTranscript,
   createMeeting,
   createOnlineMeeting,
+  createRealtimeMeeting,
   retryTranscription,
   getMeetingAnalytics,
   regenerateMetadata,
@@ -1614,7 +1625,145 @@ module.exports = {
   askAI,
   getChatHistory,
   clearChatHistory,
+  togglePin,
+  getPinnedMeetings,
 };
+
+/**
+ * Toggle pin status for a meeting (max 3 pinned per user)
+ * POST /api/meetings/:id/pin
+ */
+async function togglePin(req, res, next) {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    
+    const meeting = await Meeting.findById(id);
+    if (!meeting) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not Found',
+        message: 'Meeting not found',
+      });
+    }
+    
+    // Check if user has access (owner or collaborator)
+    const permission = getResourcePermission(meeting, userId);
+    if (!permission.canView) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden',
+        message: 'You do not have access to this meeting',
+      });
+    }
+    
+    // Initialize pinnedBy array if not exists
+    if (!meeting.pinnedBy) {
+      meeting.pinnedBy = [];
+    }
+    
+    // Check if user already has this meeting pinned
+    const existingPinIndex = meeting.pinnedBy.findIndex(
+      pin => pin.user.toString() === userId.toString()
+    );
+    const isCurrentlyPinned = existingPinIndex !== -1;
+    const newPinnedState = !isCurrentlyPinned;
+    
+    // If trying to pin, check limit (max 3 total pinned meetings for this user)
+    if (newPinnedState) {
+      const pinnedCount = await Meeting.countDocuments({
+        'pinnedBy.user': userId,
+        deleted: { $ne: true },
+      });
+      
+      if (pinnedCount >= 3) {
+        return res.status(400).json({
+          success: false,
+          error: 'Limit Exceeded',
+          message: 'Maximum 3 meetings can be pinned. Unpin another meeting first.',
+        });
+      }
+      
+      // Add user to pinnedBy array
+      meeting.pinnedBy.push({ user: userId, pinnedAt: new Date() });
+    } else {
+      // Remove user from pinnedBy array
+      meeting.pinnedBy.splice(existingPinIndex, 1);
+    }
+    
+    await meeting.save();
+    
+    logger.info(`Meeting ${id} ${newPinnedState ? 'pinned' : 'unpinned'} by user ${userId}`);
+    
+    res.json({
+      success: true,
+      message: `Meeting ${newPinnedState ? 'pinned' : 'unpinned'} successfully`,
+      data: {
+        id: meeting._id,
+        pinned: newPinnedState,
+        pinnedAt: newPinnedState ? meeting.pinnedBy.find(p => p.user.toString() === userId.toString())?.pinnedAt : null,
+      },
+    });
+  } catch (error) {
+    logger.error('Error toggling pin:', error);
+    next(error);
+  }
+}
+
+/**
+ * Get all pinned meetings for current user
+ * GET /api/meetings/pinned
+ */
+async function getPinnedMeetings(req, res, next) {
+  try {
+    const userId = req.user.id;
+    
+    const meetings = await Meeting.find({
+      'pinnedBy.user': userId,
+      deleted: { $ne: true },
+    })
+      .sort({ 'pinnedBy.pinnedAt': -1 })
+      .select('title status platform type pinnedBy createdAt userId collaborators shareToken')
+      .limit(3);
+    
+    // Transform to include user-specific pinned info and userRole
+    const transformedMeetings = meetings.map(meeting => {
+      const userPin = meeting.pinnedBy?.find(p => p.user.toString() === userId.toString());
+      
+      // Determine user role
+      let userRole = 'viewer';
+      const isOwner = meeting.userId && meeting.userId.toString() === userId.toString();
+      if (isOwner) {
+        userRole = 'owner';
+      } else if (meeting.collaborators && Array.isArray(meeting.collaborators)) {
+        const col = meeting.collaborators.find(c => c && c.user && c.user.toString() === userId.toString());
+        if (col && col.role) userRole = col.role;
+      }
+      
+      return {
+        _id: meeting._id,
+        title: meeting.title,
+        status: meeting.status,
+        platform: meeting.platform,
+        type: meeting.type,
+        createdAt: meeting.createdAt,
+        pinned: true,
+        pinnedAt: userPin?.pinnedAt,
+        userRole,
+        shareToken: meeting.shareToken,
+      };
+    });
+    
+    res.json({
+      success: true,
+      count: transformedMeetings.length,
+      data: transformedMeetings,
+    });
+  } catch (error) {
+    logger.error('Error getting pinned meetings:', error);
+    next(error);
+  }
+}
 
 /**
  * Create a new meeting
@@ -1728,6 +1877,188 @@ async function createOnlineMeeting(req, res, next) {
     });
   } catch (error) {
     logger.error('Error creating online meeting:', error);
+    next(error);
+  }
+}
+
+/**
+ * Create meeting from realtime microphone transcription
+ * POST /api/meetings/realtime
+ * 
+ * This receives the finalized transcription result from the realtime session
+ * and saves it as a completed meeting.
+ * Supports both JSON body and multipart/form-data (with audio file)
+ */
+async function createRealtimeMeeting(req, res, next) {
+  const { uploadFile } = require('../config/minio');
+  const { Readable } = require('stream');
+  
+  try {
+    // Handle both JSON and FormData
+    let title, description, sessionId, transcript, segments, speakers;
+    let numSpeakers, duration, language, aiNotes, processingTime;
+    
+    if (req.file) {
+      // FormData request - parse JSON strings
+      title = req.body.title;
+      description = req.body.description;
+      sessionId = req.body.sessionId;
+      transcript = req.body.transcript;
+      segments = JSON.parse(req.body.segments || '[]');
+      speakers = req.body.speakers ? JSON.parse(req.body.speakers) : null;
+      numSpeakers = req.body.numSpeakers ? parseInt(req.body.numSpeakers) : null;
+      duration = parseFloat(req.body.duration || '0');
+      language = req.body.language;
+      aiNotes = req.body.aiNotes ? JSON.parse(req.body.aiNotes) : null;
+      processingTime = req.body.processingTime ? parseFloat(req.body.processingTime) : null;
+    } else {
+      // JSON request
+      ({ title, description, sessionId, transcript, segments, speakers, 
+         numSpeakers, duration, language, aiNotes, processingTime } = req.body);
+    }
+    
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Title is required',
+      });
+    }
+    
+    if (!transcript || !segments) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Transcription data is required',
+      });
+    }
+    
+    // Build summary snippet from AI summary or first part of transcript
+    const summarySnippet = aiNotes?.summary 
+      ? aiNotes.summary.substring(0, 200) 
+      : transcript.substring(0, 200);
+    
+    // Use AI-generated description if not provided
+    const meetingDescription = description || aiNotes?.suggestedDescription || '';
+    
+    // Create the meeting with completed transcription
+    const meeting = await Meeting.create({
+      userId: req.user.id,
+      title,
+      description: meetingDescription,
+      type: MEETING_TYPE.REALTIME,
+      platform: PLATFORM.MICROPHONE,
+      status: MEETING_STATUS.COMPLETED,
+      startedAt: new Date(Date.now() - (duration * 1000)),
+      endedAt: new Date(),
+      duration: Math.round(duration),
+      participants: numSpeakers || 1,
+      transcription: {
+        language: language || 'id',
+        transcript,
+        segments: segments.map(seg => ({
+          start: seg.start,
+          end: seg.end,
+          text: seg.text,
+          speaker: seg.speaker || 'SPEAKER_0',
+        })),
+        // Handle speakers as either dict (speaker_timeline) or array format
+        // The speakerSchema expects {speaker, start, end} but speaker_timeline provides {SPEAKER_X: totalDuration}
+        // We need to convert dict format to array with estimated start/end based on segment appearances
+        speakers: Array.isArray(speakers) 
+          ? speakers.map(s => ({
+              speaker: s.speaker,
+              start: s.start || 0,
+              end: s.end || (duration || 0),
+            }))
+          : (speakers 
+              ? Object.keys(speakers).map((spk, idx) => ({
+                  speaker: spk,
+                  start: 0, // Will use segments to determine actual appearances
+                  end: speakers[spk] || (duration || 0), // Use total speaker duration as end
+                }))
+              : []),
+        summary: aiNotes?.summary || '',
+        highlights: aiNotes?.highlights || {},
+        conclusion: aiNotes?.conclusion || '',
+        numSpeakers: numSpeakers || 1,
+        processingTime: processingTime || 0,
+        diarizationMethod: 'mfcc_clustering',
+      },
+      actionItems: (aiNotes?.actionItems || []).map(item => ({
+        title: item.title || 'Untitled Task',
+        description: item.description || '',
+        priority: item.priority || 'medium',
+        // dueDate is now consolidated - use item.dueDate directly (already parsed or raw ISO string)
+        dueDate: item.dueDate ? new Date(item.dueDate) : null,
+        assigneeName: item.assigneeName || null,
+        labels: item.labels || [],
+        status: item.status || 'todo',
+      })),
+      suggestedTitle: aiNotes?.suggestedTitle || title,
+      tags: aiNotes?.tags || [],
+      summarySnippet,
+      processingMeta: {
+        sessionId,
+        processingStartedAt: new Date(Date.now() - ((processingTime || 0) * 1000)),
+        lastUpdatedAt: new Date(),
+        currentStage: 'completed',
+      },
+    });
+    
+    // Upload audio file to MinIO if provided
+    if (req.file && req.file.buffer) {
+      try {
+        const audioFilename = `realtime/${req.user.id}/${meeting._id}/recording.webm`;
+        const audioStream = Readable.from(req.file.buffer);
+        
+        await uploadFile(audioStream, audioFilename, {
+          'Content-Type': req.file.mimetype || 'audio/webm',
+          'x-amz-meta-meeting-id': meeting._id.toString(),
+          'x-amz-meta-user-id': req.user.id,
+        });
+        
+        // Update meeting with original file info
+        meeting.originalFile = {
+          filename: audioFilename,
+          originalName: 'recording.webm',
+          mimetype: req.file.mimetype || 'audio/webm',
+          size: req.file.size,
+          path: audioFilename,
+          uploadedAt: new Date(),
+        };
+        
+        logger.info(`Audio file uploaded to MinIO: ${audioFilename}`);
+      } catch (uploadError) {
+        logger.error('Failed to upload audio to MinIO:', uploadError);
+        // Continue without audio - meeting data is still saved
+      }
+    }
+    
+    // Add a processing log
+    meeting.processingLogs = [{
+      message: 'Realtime transcription completed',
+      timestamp: new Date(),
+      progress: 100,
+      stage: 'completed',
+    }];
+    await meeting.save();
+    
+    logger.info(`Realtime meeting created: ${meeting._id} by user ${req.user.id}, session: ${sessionId}`);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Realtime meeting saved successfully',
+      data: {
+        id: meeting._id,
+        title: meeting.title,
+        duration: meeting.duration,
+        numSpeakers: meeting.transcription.numSpeakers,
+        status: meeting.status,
+      },
+    });
+  } catch (error) {
+    logger.error('Error creating realtime meeting:', error);
     next(error);
   }
 }

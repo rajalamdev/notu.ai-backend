@@ -1,5 +1,6 @@
 const socketIo = require('socket.io');
 const logger = require('../utils/logger');
+const realtimeTranscriptionService = require('./realtimeTranscriptionService');
 
 let io;
 
@@ -105,6 +106,147 @@ const initSocket = (server) => {
         userName 
       });
     });
+
+    // ========== REALTIME TRANSCRIPTION EVENTS ==========
+    
+    // Start realtime transcription session
+    socket.on('start_realtime_transcription', (data) => {
+      const { meetingName } = data || {};
+      const userId = socket.userData?.id || socket.id;
+      
+      try {
+        const session = realtimeTranscriptionService.createSession(userId, meetingName);
+        socket.realtimeSessionId = session.id;
+        
+        // Join a room for this session
+        socket.join(`realtime_${session.id}`);
+        
+        socket.emit('realtime_session_started', {
+          sessionId: session.id,
+          startedAt: session.startedAt,
+        });
+        
+        logger.info(`[Realtime] Session started: ${session.id} by ${userId}`);
+      } catch (error) {
+        logger.error(`[Realtime] Start session error: ${error.message}`);
+        socket.emit('realtime_error', { error: error.message });
+      }
+    });
+    
+    // Receive audio chunk for transcription
+    socket.on('audio_chunk', async (data) => {
+      const { sessionId, audioData, chunkIndex } = data;
+      
+      if (!sessionId) {
+        socket.emit('realtime_error', { error: 'No session ID provided' });
+        return;
+      }
+      
+      try {
+        // Convert base64 to buffer if needed
+        const audioBuffer = Buffer.isBuffer(audioData) 
+          ? audioData 
+          : Buffer.from(audioData, 'base64');
+        
+        const result = await realtimeTranscriptionService.processAudioChunk(
+          sessionId,
+          audioBuffer,
+          chunkIndex
+        );
+        
+        if (result.success && result.text) {
+          // Emit preview transcript back to client
+          socket.emit('preview_transcript', {
+            sessionId,
+            text: result.text,
+            chunkIndex,
+            processingTime: result.processingTime,
+          });
+          
+          // Also emit accumulated preview
+          const preview = realtimeTranscriptionService.getSessionPreview(sessionId);
+          if (preview) {
+            socket.emit('accumulated_transcript', {
+              sessionId,
+              text: preview.text,
+              chunksProcessed: preview.chunksProcessed,
+              duration: preview.duration,
+            });
+          }
+        }
+      } catch (error) {
+        logger.error(`[Realtime] Audio chunk error: ${error.message}`);
+        socket.emit('realtime_error', { 
+          error: error.message,
+          chunkIndex,
+        });
+      }
+    });
+    
+    // Stop realtime transcription and get final result
+    socket.on('stop_realtime_transcription', async (data) => {
+      const { sessionId, audioData, options } = data || {};
+      const targetSessionId = sessionId || socket.realtimeSessionId;
+      
+      if (!targetSessionId) {
+        socket.emit('realtime_error', { error: 'No active session' });
+        return;
+      }
+      
+      try {
+        socket.emit('realtime_processing', {
+          sessionId: targetSessionId,
+          message: 'Processing final transcription with diarization...',
+        });
+        
+        // Convert base64 to buffer if audio data is provided
+        let audioBuffer = null;
+        if (audioData) {
+          audioBuffer = Buffer.isBuffer(audioData)
+            ? audioData
+            : Buffer.from(audioData, 'base64');
+        }
+        
+        const result = await realtimeTranscriptionService.finalizeSession(
+          targetSessionId,
+          audioBuffer,
+          options || {}
+        );
+        
+        socket.emit('final_transcript', {
+          sessionId: targetSessionId,
+          ...result,
+        });
+        
+        // Leave the session room
+        socket.leave(`realtime_${targetSessionId}`);
+        socket.realtimeSessionId = null;
+        
+        logger.info(`[Realtime] Session finalized: ${targetSessionId}`);
+      } catch (error) {
+        logger.error(`[Realtime] Stop session error: ${error.message}`);
+        socket.emit('realtime_error', { 
+          error: error.message,
+          sessionId: targetSessionId,
+        });
+      }
+    });
+    
+    // Cancel realtime transcription session
+    socket.on('cancel_realtime_transcription', (data) => {
+      const { sessionId } = data || {};
+      const targetSessionId = sessionId || socket.realtimeSessionId;
+      
+      if (targetSessionId) {
+        realtimeTranscriptionService.cancelSession(targetSessionId);
+        socket.leave(`realtime_${targetSessionId}`);
+        socket.realtimeSessionId = null;
+        socket.emit('realtime_cancelled', { sessionId: targetSessionId });
+        logger.info(`[Realtime] Session cancelled: ${targetSessionId}`);
+      }
+    });
+
+    // ========== END REALTIME TRANSCRIPTION EVENTS ==========
 
     socket.on('disconnect', () => {
       logger.info(`Client disconnected: ${socket.id}`);

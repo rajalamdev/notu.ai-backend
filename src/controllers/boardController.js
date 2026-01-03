@@ -71,6 +71,15 @@ exports.getBoards = async (req, res) => {
     // Map boards with permission info
     const boardsWithRole = boards.map(board => {
       const permission = getResourcePermission(board, currentUserId);
+      
+      // Check if user has pinned this board
+      const isPinned = currentUserId && board.pinnedBy && Array.isArray(board.pinnedBy) 
+        ? board.pinnedBy.some(p => p.user && p.user.toString() === currentUserId.toString())
+        : false;
+
+      // Only include shareToken for owner/admin
+      const canShare = permission.isOwner || permission.role === 'admin';
+
       return {
         ...board,
         userRole: permission.role || 'viewer',
@@ -78,6 +87,8 @@ exports.getBoards = async (req, res) => {
         canEdit: permission.canEdit,
         canDelete: permission.canDelete,
         canManageCollaborators: permission.canManageCollaborators,
+        pinned: isPinned,
+        ...(canShare && board.shareToken ? { shareToken: board.shareToken } : {}),
       };
     });
 
@@ -735,6 +746,128 @@ exports.revokeShareLink = async (req, res) => {
     res.json({ success: true, message: 'Share link revoked' });
   } catch (error) {
     logger.error('revokeShareLink error:', error);
+    res.status(500).json({ success: false, message: 'Server Error' });
+  }
+};
+
+/**
+ * Toggle pin status for a board (max 3 pinned per user)
+ * POST /api/boards/:id/pin
+ */
+exports.togglePin = async (req, res) => {
+  try {
+    const board = await Board.findById(req.params.id);
+    if (!board) {
+      return res.status(404).json({ success: false, message: 'Board not found' });
+    }
+
+    const currentUserId = req.user?.id || req.user?._id;
+    const permission = getResourcePermission(board, currentUserId);
+
+    if (!permission.canView) {
+      return res.status(403).json({ success: false, message: 'You do not have access to this board' });
+    }
+
+    // Initialize pinnedBy array if not exists
+    if (!board.pinnedBy) {
+      board.pinnedBy = [];
+    }
+
+    // Check if user already has this board pinned
+    const existingPinIndex = board.pinnedBy.findIndex(
+      pin => pin.user.toString() === currentUserId.toString()
+    );
+    const isCurrentlyPinned = existingPinIndex !== -1;
+    const newPinnedState = !isCurrentlyPinned;
+
+    // If trying to pin, check limit (max 3 total pinned boards for this user)
+    if (newPinnedState) {
+      const pinnedCount = await Board.countDocuments({
+        'pinnedBy.user': currentUserId,
+      });
+
+      if (pinnedCount >= 3) {
+        return res.status(400).json({
+          success: false,
+          message: 'Maximum 3 boards can be pinned. Unpin another board first.',
+        });
+      }
+
+      // Add user to pinnedBy array
+      board.pinnedBy.push({ user: currentUserId, pinnedAt: new Date() });
+    } else {
+      // Remove user from pinnedBy array
+      board.pinnedBy.splice(existingPinIndex, 1);
+    }
+
+    await board.save();
+
+    logger.info(`Board ${req.params.id} ${newPinnedState ? 'pinned' : 'unpinned'} by user ${currentUserId}`);
+
+    res.json({
+      success: true,
+      message: `Board ${newPinnedState ? 'pinned' : 'unpinned'} successfully`,
+      data: {
+        id: board._id,
+        pinned: newPinnedState,
+        pinnedAt: newPinnedState ? board.pinnedBy.find(p => p.user.toString() === currentUserId.toString())?.pinnedAt : null,
+      },
+    });
+  } catch (error) {
+    logger.error('togglePin error:', error);
+    res.status(500).json({ success: false, message: 'Server Error' });
+  }
+};
+
+/**
+ * Get all pinned boards for current user
+ * GET /api/boards/pinned
+ */
+exports.getPinnedBoards = async (req, res) => {
+  try {
+    const currentUserId = req.user?.id || req.user?._id;
+
+    const boards = await Board.find({
+      'pinnedBy.user': currentUserId,
+    })
+      .sort({ 'pinnedBy.pinnedAt': -1 })
+      .select('title pinnedBy createdAt meetingId userId collaborators shareToken')
+      .populate('meetingId', 'title')
+      .limit(3);
+
+    // Transform to include user-specific pinned info and userRole
+    const transformedBoards = boards.map(board => {
+      const userPin = board.pinnedBy?.find(p => p.user.toString() === currentUserId.toString());
+      
+      // Determine user role
+      let userRole = 'viewer';
+      const isOwner = board.userId && board.userId.toString() === currentUserId.toString();
+      if (isOwner) {
+        userRole = 'owner';
+      } else if (board.collaborators && Array.isArray(board.collaborators)) {
+        const col = board.collaborators.find(c => c && c.user && c.user.toString() === currentUserId.toString());
+        if (col && col.role) userRole = col.role;
+      }
+      
+      return {
+        _id: board._id,
+        title: board.title,
+        meetingId: board.meetingId,
+        createdAt: board.createdAt,
+        pinned: true,
+        pinnedAt: userPin?.pinnedAt,
+        userRole,
+        shareToken: board.shareToken,
+      };
+    });
+
+    res.json({
+      success: true,
+      count: transformedBoards.length,
+      data: transformedBoards,
+    });
+  } catch (error) {
+    logger.error('getPinnedBoards error:', error);
     res.status(500).json({ success: false, message: 'Server Error' });
   }
 };

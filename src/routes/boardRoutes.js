@@ -12,10 +12,15 @@ const {
   joinBoard,
   revokeShareLink,
   updateCollaboratorRole,
-  removeCollaborator
+  removeCollaborator,
+  togglePin,
+  getPinnedBoards
 } = require('../controllers/boardController');
 
 router.use(authenticate);
+
+// Pinned boards (must be before :id routes)
+router.get('/pinned', getPinnedBoards);
 
 router.get('/', getBoards);
 router.post('/', createBoard);
@@ -30,5 +35,8 @@ router.post('/join/:token', joinBoard);
 router.delete('/:id/share', revokeShareLink);
 router.patch('/:id/collaborators/:userId', updateCollaboratorRole);
 router.delete('/:id/collaborators/:userId', removeCollaborator);
+
+// Pin
+router.post('/:id/pin', togglePin);
 
 module.exports = router;
