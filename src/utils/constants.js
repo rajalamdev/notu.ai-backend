@@ -14,12 +14,14 @@ module.exports = {
   MEETING_STATUS: {
     PENDING: 'pending',
     QUEUED: 'queued',
+    BOT_JOINING: 'bot_joining',  // Bot is connecting to meeting
+    RECORDING: 'recording',      // Bot is recording/transcribing live
     PROCESSING: 'processing',
     COMPLETED: 'completed',
     FAILED: 'failed',
   },
 
-  // Progress weights for stage-based progress (no time estimation)
+  // Progress weights for stage-based progress (UPLOAD workflow)
   // Ranges are NON-OVERLAPPING: each stage ends just before next starts
   PROGRESS_WEIGHTS: {
     starting: { start: 0, end: 9 },
@@ -28,6 +30,14 @@ module.exports = {
     diarization: { start: 70, end: 79 },
     ai_analysis: { start: 80, end: 89 },
     saving: { start: 90, end: 99 },
+    completed: { start: 100, end: 100 },
+  },
+
+  // Progress weights for BOT/ONLINE MEETING workflow - 4 stages
+  BOT_PROGRESS_WEIGHTS: {
+    bot_connecting: { start: 0, end: 19 },
+    bot_joining: { start: 20, end: 39 },
+    bot_recording: { start: 40, end: 99 },  // Combined recording + transcription
     completed: { start: 100, end: 100 },
   },
 

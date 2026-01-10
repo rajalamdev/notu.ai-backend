@@ -34,4 +34,25 @@ router.get('/platforms', analyticsController.getPlatformStats);
  */
 router.get('/activity', analyticsController.getRecentActivity);
 
+/**
+ * @route   GET /api/analytics/global
+ * @desc    Get global analytics overview
+ * @access  Private
+ */
+router.get('/global', analyticsController.getGlobalAnalytics);
+
+/**
+ * @route   GET /api/analytics/meetings
+ * @desc    Get detail analytics list (paginated, sortable)
+ * @access  Private
+ */
+router.get('/meetings', analyticsController.getDetailAnalyticsList);
+
+/**
+ * @route   GET /api/analytics/meetings/:id/detail
+ * @desc    Get individual meeting detail analytics
+ * @access  Private
+ */
+router.get('/meetings/:id/detail', analyticsController.getMeetingDetailAnalytics);
+
 module.exports = router;

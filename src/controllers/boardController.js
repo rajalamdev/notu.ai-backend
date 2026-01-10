@@ -1,4 +1,5 @@
 // @ts-nocheck
+const mongoose = require('mongoose');
 const Board = require('../models/Board');
 const Task = require('../models/Task');
 const Meeting = require('../models/Meeting');
@@ -18,18 +19,29 @@ exports.getBoards = async (req, res) => {
     const skip = (page - 1) * limit;
     const search = req.query.search;
     const currentUserId = req.user?.id || req.user?._id;
+    let reqUserId = null;
+    try {
+      if (currentUserId) {
+        reqUserId = new mongoose.Types.ObjectId(currentUserId);
+      }
+    } catch (e) {
+      console.warn('Invalid user ID for board aggregation:', currentUserId);
+    }
 
     let query = {};
 
+    // Use ObjectId for aggregation matching
+    const userIdToMatch = reqUserId || req.user.id;
+
     if (filter === 'mine') {
-      query.userId = req.user.id;
+      query.userId = userIdToMatch;
     } else if (filter === 'shared') {
-      query['collaborators.user'] = req.user.id;
-      query.userId = { $ne: req.user.id };
+      query['collaborators.user'] = userIdToMatch;
+      query.userId = { $ne: userIdToMatch };
     } else {
       query.$or = [
-        { userId: req.user.id },
-        { 'collaborators.user': req.user.id }
+        { userId: userIdToMatch },
+        { 'collaborators.user': userIdToMatch }
       ];
     }
 
@@ -57,29 +69,39 @@ exports.getBoards = async (req, res) => {
       query.meetingId = req.query.meetingId
     }
 
-    const boards = await Board.find(query)
+    // Aggregation Pipeline for Pinned Sorting
+
+    // Use standard find to avoid Aggregation ObjectId casting issues
+    const boardsAll = await Board.find(query)
       .populate('userId', 'name email image')
       .populate('collaborators.user', 'name email image')
       .populate('meetingId', 'title')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
       .lean();
 
-    const total = await Board.countDocuments(query);
+    const currentUserIdStr = currentUserId ? String(currentUserId) : null;
 
-    // Map boards with permission info
-    const boardsWithRole = boards.map(board => {
-      const permission = getResourcePermission(board, currentUserId);
-      
-      // Check if user has pinned this board
-      const isPinned = currentUserId && board.pinnedBy && Array.isArray(board.pinnedBy) 
-        ? board.pinnedBy.some(p => p.user && p.user.toString() === currentUserId.toString())
+    // Calculate pinned info and Sort in memory (Pinned First, then Newest)
+    const boardsSorted = boardsAll.map(board => {
+      const isPinned = currentUserIdStr && board.pinnedBy && Array.isArray(board.pinnedBy)
+        ? board.pinnedBy.some(p => p.user && String(p.user) === currentUserIdStr)
         : false;
+      return { ...board, isPinned };
+    }).sort((a, b) => {
+      // 1. Pinned first
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      // 2. Newest first
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
 
-      // Only include shareToken for owner/admin
+    // Manual Pagination
+    const total = boardsSorted.length;
+    const startIndex = (page - 1) * limit;
+    const paginatedBoards = boardsSorted.slice(startIndex, startIndex + limit);
+
+    // Map permissions
+    const boardsWithRole = paginatedBoards.map(board => {
+      const permission = getResourcePermission(board, currentUserId);
       const canShare = permission.isOwner || permission.role === 'admin';
-
       return {
         ...board,
         userRole: permission.role || 'viewer',
@@ -87,7 +109,7 @@ exports.getBoards = async (req, res) => {
         canEdit: permission.canEdit,
         canDelete: permission.canDelete,
         canManageCollaborators: permission.canManageCollaborators,
-        pinned: isPinned,
+        pinned: board.isPinned,
         ...(canShare && board.shareToken ? { shareToken: board.shareToken } : {}),
       };
     });

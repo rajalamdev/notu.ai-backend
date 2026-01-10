@@ -114,27 +114,38 @@ async function getAllMeetings(req, res, next) {
     const type = req.query.type;
     const search = req.query.search;
 
+    const reqUserId = req.user ? new mongoose.Types.ObjectId(req.user.id) : null;
+
     // Build query - filter by user if authenticated
     const query = {};
     // Exclude soft-deleted meetings by default (treat missing field as not deleted)
     query.deleted = { $ne: true };
-    if (req.user && req.user.id) {
+    
+    if (reqUserId) {
       const filter = req.query.filter || 'all';
       
       if (filter === 'mine') {
-        query.userId = req.user.id;
+        query.userId = reqUserId;
       } else if (filter === 'shared') {
-        query['collaborators.user'] = req.user.id;
-        query.userId = { $ne: req.user.id }; // Ensure not owner
+        query['collaborators.user'] = reqUserId;
+        query.userId = { $ne: reqUserId }; // Ensure not owner
       } else {
         query.$or = [
-          { userId: req.user.id },
-          { 'collaborators.user': req.user.id }
+          { userId: reqUserId },
+          { 'collaborators.user': reqUserId }
         ];
       }
     }
 
-    if (status) query.status = status;
+    if (status) {
+      if (status === 'active') {
+        query.status = { 
+          $in: ['processing', 'uploading', 'recording', 'bot_joining', 'in_meeting', 'queued', 'pending'] 
+        };
+      } else {
+        query.status = status;
+      }
+    }
     if (type) {
       // support comma-separated list of types (e.g. "online,realtime")
       if (typeof type === 'string' && type.includes(',')) {
@@ -143,6 +154,10 @@ async function getAllMeetings(req, res, next) {
       } else {
         query.type = type;
       }
+    }
+    const platform = req.query.platform;
+    if (platform) {
+      query.platform = platform;
     }
     if (search) {
       const searchOr = [
@@ -160,17 +175,34 @@ async function getAllMeetings(req, res, next) {
       }
     }
 
-    // Get meetings (list view: include only small, necessary fields)
-    const meetings = await Meeting.find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile shareToken pinnedBy'); // include status, platform, logs for status page
+    // Fetch all matches
+    const allMatches = await Meeting.find(query)
+      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile shareToken pinnedBy')
+      .lean();
 
-    const total = await Meeting.countDocuments(query);
+    const currentUserIdStr = reqUserId ? String(reqUserId) : null;
 
-    // Gather action item counts and board existence for the current page of meetings
-    const meetingIds = meetings.map(m => m._id);
+    // Calculate pinned status and sort by pinned first, then newest
+    const sortedMeetings = allMatches.map(m => {
+      let isPinned = false;
+      if (currentUserIdStr && m.pinnedBy && Array.isArray(m.pinnedBy)) {
+        isPinned = m.pinnedBy.some(p => p.user && String(p.user) === currentUserIdStr);
+      }
+      return { ...m, isPinned };
+    }).sort((a, b) => {
+      // 1. Pinned first
+      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+      // 2. Newest first
+      return new Date(b.createdAt) - new Date(a.createdAt);
+    });
+
+    const total = sortedMeetings.length;
+    
+    // Pagination
+    const paginatedMeetings = sortedMeetings.slice(skip, skip + limit);
+
+    // Gather action item counts and board existence for the current page
+    const meetingIds = paginatedMeetings.map(m => m._id);
 
     const actionAgg = await Task.aggregate([
       { $match: { meetingId: { $in: meetingIds } } },
@@ -185,61 +217,48 @@ async function getAllMeetings(req, res, next) {
     const boardMap = boardAgg.reduce((acc, cur) => (acc.set(String(cur._id), cur.count), acc), new Map());
 
     // Map meetings to include lightweight derived fields for frontend
-    const mapped = meetings.map((m) => {
-      const obj = m.toObject();
+    const mapped = paginatedMeetings.map((obj) => {
+      // already lean()
 
       // Canonicalize title: prefer explicit title, fall back to suggestedTitle
       const title = obj.title || obj.suggestedTitle || 'Untitled Meeting';
-
-      const currentUserId = req.user?.id || req.user?._id;
+      // Canonicalize type
+      const mappedType = obj.type === MEETING_TYPE.UPLOAD ? 'upload' : (obj.type === MEETING_TYPE.REALTIME ? 'realtime' : 'online');
       
-      // Use centralized permission helper for consistent role detection
-      const permission = getResourcePermission(obj, currentUserId);
-
-      const actionCount = actionMap.get(String(obj._id)) || 0;
-      const hasBoard = (boardMap.get(String(obj._id)) || 0) > 0;
-
-      // Get latest progress from logs
-      const latestLog = obj.processingLogs && obj.processingLogs.length > 0 
-        ? obj.processingLogs[obj.processingLogs.length - 1] 
-        : null;
-
-      // Check if user has pinned this meeting
-      const isPinned = currentUserId && obj.pinnedBy && Array.isArray(obj.pinnedBy) 
-        ? obj.pinnedBy.some(p => p.user && p.user.toString() === currentUserId.toString())
-        : false;
-
-      // Only include shareToken for owner/admin
-      const canShare = permission.isOwner || permission.role === 'admin';
+      // Determine user role (owner vs collaborator)
+      let userRole = 'viewer';
+      if (reqUserId && idEquals(obj.userId, reqUserId)) {
+        userRole = 'owner';
+      } else if (obj.collaborators && reqUserId) {
+        const collab = obj.collaborators.find(c => idEquals(c.user, reqUserId));
+        if (collab) userRole = collab.role;
+      }
 
       return {
         _id: obj._id,
-        title,
-        type: obj.type || 'upload',
-        status: obj.status || 'pending',
-        platform: obj.platform || 'Upload',
-        description: obj.description || '',
-        tags: obj.tags || [],
+        title: title,
+        type: mappedType,
+        status: obj.status,
+        platform: obj.platform, // pass platform (e.g. google_meet, zoom)
+        description: obj.description,
+        tags: obj.tags,
         createdAt: obj.createdAt,
         updatedAt: obj.updatedAt,
-        userId: obj.userId,
-        isPublic: obj.isPublic || false,
-        isOwner: permission.isOwner,
-        isCollaborator: permission.canView && !permission.isOwner,
-        userRole: permission.role || 'viewer',
-        canEdit: permission.canEdit,
-        canDelete: permission.canDelete,
-        canManageCollaborators: permission.canManageCollaborators,
-        actionItemCount: actionCount,
-        hasBoard,
-        duration: obj.duration || 0,
-        participants: obj.participants || 0,
-        originalFilename: obj.originalFile?.originalName || '',
-        processingLogs: obj.processingLogs || [],
-        processingProgress: latestLog?.progress || 0,
-        processingStage: latestLog?.stage || null,
-        pinned: isPinned,
-        ...(canShare && obj.shareToken ? { shareToken: obj.shareToken } : {}),
+        userRole,
+        isUpload: obj.type === MEETING_TYPE.UPLOAD,
+        actionItemsCount: actionMap.get(String(obj._id)) || 0,
+        hasBoard: boardMap.has(String(obj._id)),
+        processingProgress: (obj.processingMeta && obj.processingMeta.progress) || 0,
+        processingStage: (obj.processingMeta && obj.processingMeta.stage) || null,
+        // Include minimal processing logs (last 3) if active status
+        processingLogs: ['processing', 'uploading', 'recording'].includes(obj.status) 
+          ? (obj.processingLogs || []).slice(-3) 
+          : [],
+        duration: obj.duration,
+        participants: obj.participants ? obj.participants.length : 0,
+        originalFilename: obj.originalFile ? obj.originalFile.originalName : null,
+        shareToken: obj.shareToken,
+        pinned: obj.isPinned
       };
     });
 
@@ -247,10 +266,10 @@ async function getAllMeetings(req, res, next) {
       success: true,
       meetings: mapped,
       pagination: {
-        page,
-        limit,
-        total,
+        totalItems: total,
         totalPages: Math.ceil(total / limit),
+        currentPage: page,
+        itemsPerPage: limit
       },
     });
   } catch (error) {

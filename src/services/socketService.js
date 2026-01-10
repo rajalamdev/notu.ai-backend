@@ -248,6 +248,75 @@ const initSocket = (server) => {
 
     // ========== END REALTIME TRANSCRIPTION EVENTS ==========
 
+    // ========== BOT SERVICE EVENTS ==========
+    
+    // Bot service connected
+    socket.on('bot_service_connected', (data) => {
+      logger.info(`[Bot] Bot service connected: ${data?.service || 'unknown'}`);
+      socket.isBotService = true;
+    });
+
+    // Bot status change from bot service
+    socket.on('bot_status_change', (data) => {
+      const { meetingId, status, message } = data;
+      logger.info(`[Bot] Status change for meeting ${meetingId}: ${status}`);
+      
+      // Forward to meeting room
+      const roomId = `meeting_${meetingId}`;
+      io.to(roomId).emit('bot_status', {
+        meetingId,
+        status,
+        message,
+        timestamp: new Date(),
+      });
+    });
+
+    // Caption added from bot service - forward to meeting room
+    socket.on('caption_added', (data) => {
+      const { meetingId, segment } = data;
+      logger.info(`[Bot] Caption from bot for meeting ${meetingId}: ${segment?.speaker}: ${segment?.text?.substring(0, 50)}...`);
+      
+      // Forward to meeting room
+      const roomId = `meeting_${meetingId}`;
+      io.to(roomId).emit('caption_added', {
+        meetingId,
+        segment,
+        timestamp: new Date(),
+      });
+      
+      // Also emit globally for dashboard monitoring
+      io.emit('live_caption', {
+        meetingId,
+        segment,
+        timestamp: new Date(),
+      });
+    });
+
+    // Bot meeting ended from bot service
+    socket.on('bot_meeting_ended', (data) => {
+      const { meetingId, session, reason } = data;
+      logger.info(`[Bot] Meeting ended for ${meetingId}: ${reason}`);
+      
+      // Forward to meeting room
+      const roomId = `meeting_${meetingId}`;
+      io.to(roomId).emit('bot_completed', {
+        meetingId,
+        session,
+        reason,
+        timestamp: new Date(),
+      });
+      
+      // ALSO emit globally for dashboard/status-meeting page
+      io.emit('bot_status', {
+        meetingId,
+        status: 'completed',
+        message: `Meeting completed: ${reason}`,
+        timestamp: new Date(),
+      });
+    });
+
+    // ========== END BOT SERVICE EVENTS ==========
+
     socket.on('disconnect', () => {
       logger.info(`Client disconnected: ${socket.id}`);
       
@@ -414,6 +483,73 @@ const emitMeetingAiRegenerated = (meetingId, userName) => {
   }
 };
 
+// ========== BOT STATUS EVENTS ==========
+
+// Emit bot status update
+const emitBotStatus = (meetingId, status, data = {}) => {
+  if (io) {
+    const roomId = `meeting_${meetingId}`;
+    // Emit to meeting room
+    io.to(roomId).emit('bot_status', {
+      meetingId,
+      status,
+      ...data,
+      timestamp: new Date(),
+    });
+    // Also emit globally for dashboard monitoring
+    io.emit('bot_status', {
+      meetingId,
+      status,
+      ...data,
+      timestamp: new Date(),
+    });
+  }
+};
+
+// Emit caption added (from bot scraping)
+const emitCaptionAdded = (meetingId, segment) => {
+  if (io) {
+    // Emit to room for meeting-specific listeners
+    const roomId = `meeting_${meetingId}`;
+    io.to(roomId).emit('caption_added', {
+      meetingId,
+      segment,
+      timestamp: new Date(),
+    });
+    
+    // ALSO emit globally for dashboard/status-meeting page
+    io.emit('caption_added', {
+      meetingId,
+      segment,
+      timestamp: new Date(),
+    });
+  }
+};
+
+// Emit bot completed
+const emitBotCompleted = (meetingId, data = {}) => {
+  if (io) {
+    const roomId = `meeting_${meetingId}`;
+    io.to(roomId).emit('bot_completed', {
+      meetingId,
+      ...data,
+      timestamp: new Date(),
+    });
+  }
+};
+
+// Emit bot error
+const emitBotError = (meetingId, error) => {
+  if (io) {
+    const roomId = `meeting_${meetingId}`;
+    io.to(roomId).emit('bot_error', {
+      meetingId,
+      error,
+      timestamp: new Date(),
+    });
+  }
+};
+
 module.exports = {
   initSocket,
   getIo,
@@ -426,4 +562,10 @@ module.exports = {
   emitMeetingActionItemSynced,
   emitMeetingAiRegenerated,
   getRoomUsers,
+  // Bot events
+  emitBotStatus,
+  emitCaptionAdded,
+  emitBotCompleted,
+  emitBotError,
 };
+
