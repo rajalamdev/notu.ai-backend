@@ -1,4 +1,6 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { validate, schemas } = require('../middleware/validator');
 const { authenticate, optionalAuth } = require('../middleware/auth');
@@ -133,5 +135,46 @@ router.delete('/:id/chat', authenticate, asyncHandler(clearChatHistory));
  * Toggle pin status for a meeting
  */
 router.post('/:id/pin', authenticate, asyncHandler(togglePin));
+
+/**
+ * POST /api/meetings/:id/bot/stop
+ * Stop bot session for a meeting
+ */
+const { stopBot } = require('../controllers/botController');
+router.post('/:id/bot/stop', authenticate, asyncHandler(async (req, res, next) => {
+  // Map :id to meetingId for botController
+  req.params.meetingId = req.params.id;
+  return stopBot(req, res, next);
+}));
+
+/**
+ * POST /api/meetings/:id/audio-chunk
+ * Receive audio chunk from bot for transcription
+ */
+router.post('/:id/audio-chunk', optionalAuth, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { audioData, timestamp, duration, index } = req.body;
+  
+  if (!audioData) {
+    return res.json({ success: false, error: 'No audio data' });
+  }
+
+  // Create temporary directory for chunks
+  const chunksDir = path.join(process.cwd(), 'uploads', 'audio_chunks', id);
+  if (!fs.existsSync(chunksDir)) {
+    fs.mkdirSync(chunksDir, { recursive: true });
+  }
+  
+  // Save chunk (webm)
+  const buffer = Buffer.from(audioData, 'base64');
+  const filename = `${String(index).padStart(5, '0')}.webm`;
+  const filePath = path.join(chunksDir, filename);
+  
+  fs.writeFileSync(filePath, buffer);
+  
+  // console.log(`[AudioChunk] Saved chunk ${index} for meeting ${id} (${duration}s)`);
+
+  res.json({ success: true, saved: true });
+}));
 
 module.exports = router;

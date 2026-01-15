@@ -57,6 +57,9 @@ app.use('/api', apiLimiter);
 // API routes
 app.use('/api', routes);
 
+// Serve uploads statically
+app.use('/uploads', express.static(config.UPLOAD_DIR || path.join(__dirname, '../uploads')));
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({

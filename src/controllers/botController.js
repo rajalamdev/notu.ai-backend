@@ -8,6 +8,7 @@ const axios = require('axios');
 const config = require('../config/env');
 const logger = require('../utils/logger');
 const botSessionService = require('../services/botSessionService');
+const audioService = require('../services/audioService');
 const { emitToMeeting, emitBotStatus, emitCaptionAdded } = require('../services/socketService');
 
 /**
@@ -302,125 +303,245 @@ async function finalizeBotSession(req, res, next) {
     const { meetingId } = req.params;
     const { sessionId, segments, duration } = req.body;
 
-    logger.info(`[BotController] Finalizing bot session for meeting ${meetingId}, ${segments?.length || 0} segments`);
+    logger.info(`[BotController] Finalizing bot session for meeting ${meetingId}, segments: ${segments?.length || 0}`);
 
-    // Format transcript from segments
-    const transcriptText = segments
-      ?.map(s => `${s.speaker}: ${s.text}`)
-      .join('\n') || '';
-
-    // Format segments for DB (speaker-based format)
-    const formattedSegments = segments?.map((s, idx) => ({
-      speaker: s.speaker || 'Unknown',
-      text: s.text || '',
-      startTime: s.start || idx,
-      endTime: s.end || idx + 1,
-    })) || [];
-
-    // Update Meeting in database
+    // Idempotency check: Skip if already processing or completed
     const Meeting = require('../models/Meeting');
-    const meeting = await Meeting.findById(meetingId);
+    const existingMeeting = await Meeting.findById(meetingId);
     
-    if (meeting) {
-      // Update meeting with bot transcript
-      meeting.status = 'completed';
-      meeting.transcript = transcriptText;
-      meeting.segments = formattedSegments;
-      meeting.duration = duration || 0;
-      meeting.processingProgress = 100;
-      meeting.processingStage = 'completed';
-      meeting.completedAt = new Date();
-      
-      // Generate basic summary from transcript
-      if (transcriptText && !meeting.summary) {
-        meeting.summary = transcriptText.substring(0, 500) + (transcriptText.length > 500 ? '...' : '');
-      }
-      
-      await meeting.save();
-      logger.info(`[BotController] Meeting ${meetingId} updated with bot transcript`);
-      
-      // Trigger AI analysis asynchronously (don't block response)
-      if (transcriptText && transcriptText.length > 50) {
-        setImmediate(async () => {
-          try {
-            logger.info(`[BotController] Starting AI analysis for meeting ${meetingId}`);
-            const { analyzeTranscript } = require('../services/whisperxService');
-            const aiResult = await analyzeTranscript(transcriptText);
-            
-            // Update meeting with AI results
-            const meetingToUpdate = await Meeting.findById(meetingId);
-            if (meetingToUpdate && aiResult) {
-              if (aiResult.summary) {
-                meetingToUpdate.transcription = meetingToUpdate.transcription || {};
-                meetingToUpdate.transcription.summary = aiResult.summary;
-              }
-              if (aiResult.highlights) {
-                meetingToUpdate.transcription.highlights = aiResult.highlights;
-              }
-              if (aiResult.conclusion) {
-                meetingToUpdate.transcription.conclusion = aiResult.conclusion;
-              }
-              if (aiResult.actionItems && Array.isArray(aiResult.actionItems)) {
-                meetingToUpdate.actionItems = aiResult.actionItems.map(ai => ({
-                  title: ai.title || ai.text,
-                  description: ai.description || '',
-                  priority: ai.priority || 'medium',
-                  dueDate: ai.dueDate,
-                  dueDateRaw: ai.dueDateRaw,
-                  assigneeName: ai.assignee || ai.assigneeName,
-                  status: 'todo'
-                }));
-              }
-              if (aiResult.suggestedTitle) {
-                meetingToUpdate.suggestedTitle = aiResult.suggestedTitle;
-              }
-              await meetingToUpdate.save();
-              logger.info(`[BotController] AI analysis completed for meeting ${meetingId}`);
-              
-              // Emit update to frontend
-              emitBotStatus(meetingId, 'ai_completed', {
-                hasSummary: !!aiResult.summary,
-                actionItemsCount: aiResult.actionItems?.length || 0,
-              });
-            }
-          } catch (aiError) {
-            logger.error(`[BotController] AI analysis failed for meeting ${meetingId}:`, aiError.message);
-            // Don't fail - meeting is already saved with transcript
-          }
-        });
-      }
-    } else {
-      logger.warn(`[BotController] Meeting ${meetingId} not found in DB`);
+    if (!existingMeeting) {
+      logger.error(`[BotController] Meeting ${meetingId} not found`);
+      return res.status(404).json({ success: false, error: 'Meeting not found' });
+    }
+    
+    if (existingMeeting.status === 'completed' || existingMeeting.status === 'processing') {
+      logger.info(`[BotController] Meeting ${meetingId} already ${existingMeeting.status}, skipping duplicate finalization`);
+      return res.json({ 
+        success: true, 
+        message: `Already ${existingMeeting.status}`, 
+        data: { meetingId } 
+      });
     }
 
     // Update local session
-    const session = botSessionService.getBotSession(meetingId);
-    if (session) {
-      session.previewTexts = segments?.map((s, idx) => ({
-        index: idx,
-        text: `${s.speaker}: ${s.text}`,
-        timestamp: new Date(),
-        processingTime: 0,
-      })) || [];
-      session.accumulatedText = transcriptText;
-    }
+    botSessionService.updateBotSessionStatus(meetingId, 'completed');
 
-    // Emit completion event to frontend
-    emitBotStatus(meetingId, 'completed', {
-      segmentCount: segments?.length || 0,
-      duration: duration || 0,
-      transcript: transcriptText,
-    });
-
+    // Respond to Bot service immediately to prevent timeout
     res.json({
       success: true,
-      message: 'Bot session finalized',
-      data: {
-        meetingId,
-        segmentCount: segments?.length || 0,
-        transcriptLength: transcriptText.length,
-      },
+      message: 'Bot session finalized, processing started',
+      data: { meetingId }
     });
+
+    // Start Asynchronous Processing logic
+    setImmediate(async () => {
+      try {
+        // Use atomic update to prevent version conflicts with concurrent /segments calls
+        await Meeting.findByIdAndUpdate(meetingId, {
+          status: 'processing',
+          processingStage: 'transcribing',
+          processingProgress: 60,
+          $push: {
+            processingLogs: {
+              message: 'Memulai pemrosesan audio...',
+              timestamp: new Date(),
+              stage: 'transcribing'
+            }
+          }
+        });
+        
+        // Re-fetch meeting to get latest data (including any new segments)
+        const meeting = await Meeting.findById(meetingId);
+        if (!meeting) throw new Error('Meeting not found after update');
+        
+        // Notify frontend
+        emitBotStatus(meetingId, 'processing', { 
+            stage: 'transcribing', 
+            message: 'Processing audio chunks...' 
+        });
+
+        // 3. Audio Processing DISABLED (text-only mode)
+        let processingSuccess = false;
+        logger.info(`[BotController] Audio processing disabled - using caption scraping only`);
+
+        // 4. Fallback: Use Scraped Captions if Audio failed
+        if (!processingSuccess) {
+            logger.warn(`[BotController] Falling back to scraped captions for ${meetingId}`);
+            
+            const transcriptText = segments?.map(s => `${s.speaker}: ${s.text}`).join('\n') || '';
+            
+            // Enhance timestamps for scraped segments if missing
+            let extractedDuration = 0;
+            let lastEnd = 0; // ✅ MOVED: Define BEFORE usage to prevent ReferenceError
+            
+            const formattedSegments = segments?.map((s, idx) => {
+                // Estimate duration based on text length if not provided (avg 15 chars per sec)
+                const estimatedDur = Math.max(1, (s.text?.length || 0) / 15);
+                const start = s.start || lastEnd;
+                const end = s.end || (start + estimatedDur);
+                if (end > extractedDuration) extractedDuration = end;
+                lastEnd = end; // Update for next iteration
+                
+                return {
+                    speaker: s.speaker || 'Unknown',
+                    text: s.text || '',
+                    startTime: start,
+                    endTime: end,
+                };
+            }) || [];
+
+            meeting.transcript = transcriptText;
+            meeting.segments = formattedSegments;
+            if (!meeting.transcription) meeting.transcription = {};
+            meeting.transcription.transcript = transcriptText;
+            meeting.transcription.segments = formattedSegments.map(s => ({
+                start: s.startTime,
+                end: s.endTime,
+                text: s.text,
+                speaker: s.speaker,
+            }));
+            
+            // Calculate Speaker Stats - Use word count as primary metric for scraped captions
+            const speakerStats = {};
+            let totalWords = 0;
+            let totalEstimatedTime = 0;
+            
+            formattedSegments.forEach(s => {
+                const speaker = s.speaker || 'Unknown';
+                const wordCount = s.text ? s.text.split(/\s+/).filter(w => w.length > 0).length : 0;
+                const segmentDuration = s.endTime - s.startTime;
+                // Use actual duration if available, otherwise estimate from word count
+                const estimatedTime = segmentDuration > 0.5 ? segmentDuration : Math.max(1, wordCount / 2.5);
+                
+                if (!speakerStats[speaker]) {
+                    speakerStats[speaker] = { words: 0, time: 0, segments: 0 };
+                }
+                speakerStats[speaker].words += wordCount;
+                speakerStats[speaker].time += estimatedTime;
+                speakerStats[speaker].segments += 1;
+                totalWords += wordCount;
+                totalEstimatedTime += estimatedTime;
+            });
+            
+            // Save to analytics with both word-based and time-based percentages
+            meeting.analytics = meeting.analytics || {};
+            meeting.analytics.speakers = Object.keys(speakerStats).map(spk => ({
+                speaker: spk,
+                wordCount: speakerStats[spk].words,
+                talkTime: Math.round(speakerStats[spk].time),
+                segmentCount: speakerStats[spk].segments,
+                // Use word-based percentage as primary (more accurate for captions)
+                percentage: totalWords > 0 ? Math.round((speakerStats[spk].words / totalWords) * 100) : 0,
+                timePercentage: totalEstimatedTime > 0 ? Math.round((speakerStats[spk].time / totalEstimatedTime) * 100) : 0
+            }));
+            meeting.analytics.totalWords = totalWords;
+            meeting.analytics.totalSpeakingTime = Math.round(totalEstimatedTime);
+            
+            if (!meeting.duration || meeting.duration === 0) meeting.duration = extractedDuration || duration || 60; // fallback
+
+            if (transcriptText) {
+                // Trigger AI analysis
+                try {
+                    const { analyzeTranscript } = require('../services/whisperxService');
+                    // Ensure we request specific fields in prompt through the service (handled in service/LLM)
+                    const aiResult = await analyzeTranscript(transcriptText);
+                    
+                    if (aiResult) {
+                         if (!meeting.transcription) meeting.transcription = {};
+                         // Basic fields
+                         meeting.transcription.summary = aiResult.summary || "No summary generated.";
+                         if (aiResult.conclusion) meeting.transcription.conclusion = aiResult.conclusion;
+                         if (aiResult.highlights) meeting.transcription.highlights = aiResult.highlights;
+                         
+                         // Action Items & Topics
+                         if (aiResult.actionItems) meeting.actionItems = aiResult.actionItems;
+                         if (aiResult.action_items) meeting.actionItems = aiResult.action_items;
+                         if (aiResult.topics || aiResult.tags) meeting.topics = aiResult.topics || aiResult.tags;
+                         
+                         // Metadata - Update title if it's a default placeholder
+                         const isDefaultTitle = !meeting.title || 
+                             meeting.title === 'Untitled Meeting' || 
+                             meeting.title === 'Online Meeting';
+                         if (isDefaultTitle && aiResult.suggestedTitle) {
+                             meeting.title = aiResult.suggestedTitle;
+                         }
+                         meeting.description = aiResult.suggestedDescription || aiResult.summary || "";
+                    }
+                } catch (aiErr) {
+                    logger.error(`[BotController] AI Analysis failed: ${aiErr.message}`);
+                }
+            }
+            
+            // Populate transcription.speakers with calculated stats
+            if (typeof speakerStats !== 'undefined' && speakerStats && Object.keys(speakerStats).length > 0) {
+               if (!meeting.transcription) meeting.transcription = {};
+               meeting.transcription.speakers = Object.keys(speakerStats).map(spk => ({
+                   speaker: spk,
+                   wordCount: speakerStats[spk].words,
+                   talkTime: Math.round(speakerStats[spk].time),
+                   segments: speakerStats[spk].segments
+               }));
+               meeting.transcription.numSpeakers = Object.keys(speakerStats).length;
+            }
+
+        }
+
+        // 5. Finalize Meeting Status (use findByIdAndUpdate to prevent version conflicts)
+        // IMPORTANT: Include ALL data from meeting object, not just status
+        const finalUpdate = {
+            status: 'completed',
+            processingStage: 'completed',
+            processingProgress: 100,
+            completedAt: new Date(),
+            // Include transcript data
+            transcript: meeting.transcript,
+            segments: meeting.segments,
+            duration: meeting.duration,
+            // Include AI analysis results
+            transcription: meeting.transcription,
+            actionItems: meeting.actionItems,
+            topics: meeting.topics,
+            analytics: meeting.analytics,
+            // Include title/description from AI (if set)
+            title: meeting.title,
+            description: meeting.description,
+            $push: {
+                processingLogs: {
+                    message: 'Selesai.',
+                    timestamp: new Date(),
+                    stage: 'completed'
+                }
+            }
+        };
+
+        // Use findByIdAndUpdate instead of save() to avoid version conflicts
+        await Meeting.findByIdAndUpdate(meetingId, finalUpdate, { new: true });
+        
+        // Emit final status to ensure frontend updates
+        emitBotStatus(meetingId, 'completed', {
+            transcript: meeting.transcript,
+            hasAudio: !!meeting.audioUrl
+        });
+
+      } catch (asyncError) {
+         logger.error(`[BotController] Async finalization fatal error: ${asyncError.message}`);
+         // Emit failed status so frontend updates
+         emitBotStatus(meetingId, 'failed', { error: asyncError.message });
+         
+         // Still try to update meeting status in DB
+         try {
+           const Meeting = require('../models/Meeting');
+           await Meeting.findByIdAndUpdate(meetingId, {
+             status: 'failed',
+             processingStage: 'error',
+             $push: { processingLogs: { message: `Error: ${asyncError.message}`, timestamp: new Date(), stage: 'error' } }
+           });
+         } catch (dbErr) {
+           logger.error(`[BotController] Failed to update meeting status: ${dbErr.message}`);
+         }
+      }
+    });
+
   } catch (error) {
     logger.error('[BotController] Finalize error:', error);
     next(error);

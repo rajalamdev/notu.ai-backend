@@ -73,6 +73,8 @@ const meetingSchema = new mongoose.Schema({
   
   // File information
   originalFile: originalFileSchema,
+  audioUrl: String, // Direct URL to audio file
+
   
   // Transcription data
   transcription: transcriptionSchema,

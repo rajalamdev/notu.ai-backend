@@ -1,4 +1,6 @@
 const mongoose = require('mongoose');
+const fs = require('fs');
+const path = require('path');
 const Meeting = require('../models/Meeting');
 const Task = require('../models/Task');
 const Board = require('../models/Board');
@@ -56,9 +58,13 @@ function calculateAnalytics(meeting) {
       };
     }
     const wordCount = segment.text ? segment.text.trim().split(/\s+/).filter(w => w.length > 0).length : 0;
+    const segmentDuration = (segment.end || 0) - (segment.start || 0);
+    // Use word count as fallback if duration is 0 (~150 words/min = 2.5 words/sec)
+    const estimatedDuration = segmentDuration > 0.5 ? segmentDuration : Math.max(1, wordCount / 2.5);
+    
     talkTimeMap[speaker].words += wordCount;
     talkTimeMap[speaker].talks += 1;
-    talkTimeMap[speaker].totalDuration += (segment.end - segment.start);
+    talkTimeMap[speaker].totalDuration += estimatedDuration;
   });
 
   const totalTalkDuration = Object.values(talkTimeMap).reduce((sum, item) => sum + item.totalDuration, 0);
@@ -182,7 +188,7 @@ async function getAllMeetings(req, res, next) {
 
     const currentUserIdStr = reqUserId ? String(reqUserId) : null;
 
-    // Calculate pinned status and sort by pinned first, then newest
+    // Calculate pinned status and sort by newest only (no pinned priority)
     const sortedMeetings = allMatches.map(m => {
       let isPinned = false;
       if (currentUserIdStr && m.pinnedBy && Array.isArray(m.pinnedBy)) {
@@ -190,9 +196,7 @@ async function getAllMeetings(req, res, next) {
       }
       return { ...m, isPinned };
     }).sort((a, b) => {
-      // 1. Pinned first
-      if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
-      // 2. Newest first
+      // Sort by newest first only
       return new Date(b.createdAt) - new Date(a.createdAt);
     });
 
@@ -342,8 +346,8 @@ async function getMeetingById(req, res, next) {
     await meeting.populate('collaborators.user', 'name email image');
 
     // Get file URL if file exists
-    let fileUrl = null;
-    if (meeting.originalFile && meeting.originalFile.filename) {
+    let fileUrl = meeting.audioUrl || null;
+    if (!fileUrl && meeting.originalFile && meeting.originalFile.filename) {
       try {
         fileUrl = await getFileUrl(meeting.originalFile.filename, 3600);
       } catch (error) {
