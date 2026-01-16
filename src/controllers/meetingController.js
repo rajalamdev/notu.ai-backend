@@ -183,12 +183,16 @@ async function getAllMeetings(req, res, next) {
 
     // Fetch all matches
     const allMatches = await Meeting.find(query)
-      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile shareToken pinnedBy')
+      .select('title suggestedTitle type status platform description tags createdAt updatedAt userId isPublic collaborators processingLogs processingMeta duration participants originalFile shareToken pinnedBy actionItems')
       .lean();
 
     const currentUserIdStr = reqUserId ? String(reqUserId) : null;
 
-    // Calculate pinned status and sort by newest only (no pinned priority)
+    // Check if we should prioritize pinned meetings (default: true for meeting page)
+    // Pass sortByPinned=false from status-meeting page for pure latest sorting
+    const sortByPinned = req.query.sortByPinned !== 'false';
+
+    // Calculate pinned status and sort accordingly
     const sortedMeetings = allMatches.map(m => {
       let isPinned = false;
       if (currentUserIdStr && m.pinnedBy && Array.isArray(m.pinnedBy)) {
@@ -196,7 +200,12 @@ async function getAllMeetings(req, res, next) {
       }
       return { ...m, isPinned };
     }).sort((a, b) => {
-      // Sort by newest first only
+      // If sortByPinned is enabled, prioritize pinned meetings first
+      if (sortByPinned) {
+        if (a.isPinned && !b.isPinned) return -1;
+        if (!a.isPinned && b.isPinned) return 1;
+      }
+      // Then sort by newest first
       return new Date(b.createdAt) - new Date(a.createdAt);
     });
 
@@ -250,7 +259,8 @@ async function getAllMeetings(req, res, next) {
         updatedAt: obj.updatedAt,
         userRole,
         isUpload: obj.type === MEETING_TYPE.UPLOAD,
-        actionItemsCount: actionMap.get(String(obj._id)) || 0,
+        // Count from both Task collection and meeting.actionItems (AI-generated, not yet migrated)
+        actionItemsCount: (actionMap.get(String(obj._id)) || 0) + (Array.isArray(obj.actionItems) ? obj.actionItems.length : 0),
         hasBoard: boardMap.has(String(obj._id)),
         processingProgress: (obj.processingMeta && obj.processingMeta.progress) || 0,
         processingStage: (obj.processingMeta && obj.processingMeta.stage) || null,
