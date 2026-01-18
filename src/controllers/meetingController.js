@@ -1660,6 +1660,7 @@ module.exports = {
   clearChatHistory,
   togglePin,
   getPinnedMeetings,
+  getMeetingStats,
 };
 
 /**
@@ -2411,6 +2412,86 @@ async function removeCollaborator(req, res, next) {
     res.json({ success: true, message: 'Collaborator removed' });
   } catch (error) {
     logger.error('Error removing collaborator:', error);
+    next(error);
+  }
+}
+
+/**
+ * Get meeting statistics (counts by status)
+ * GET /api/meetings/stats
+ */
+async function getMeetingStats(req, res, next) {
+  try {
+    const userId = req.user.id;
+    const reqUserId = new mongoose.Types.ObjectId(userId);
+
+    // Basic query for user's meetings (owned or shared)
+    const baseQuery = {
+      $or: [
+        { userId: reqUserId },
+        { 'collaborators.user': reqUserId }
+      ],
+      deleted: { $ne: true }
+    };
+
+    // Aggregate status counts
+    const statusCounts = await Meeting.aggregate([
+      { $match: baseQuery },
+      { $group: { _id: '$status', count: { $sum: 1 } } }
+    ]);
+
+    // Map to a more usable format
+    const stats = {
+      total: 0,
+      completed: 0,
+      active: 0, // recording, processing, uploading, pending (with logs), bot_joining
+      pending: 0, // queued or pending (no logs)
+      failed: 0,
+      cancelled: 0
+    };
+
+    const activeStatuses = ['recording', 'processing', 'uploading', 'bot_joining', 'in_meeting'];
+    
+    statusCounts.forEach(item => {
+      const status = item._id || 'unknown';
+      const count = item.count;
+      stats.total += count;
+      
+      if (status === 'completed') {
+        stats.completed += count;
+      } else if (activeStatuses.includes(status)) {
+        stats.active += count;
+      } else if (status === 'failed' || status === 'error') {
+        stats.failed += count;
+      } else if (status === 'cancelled') {
+        stats.cancelled += count;
+      } else {
+        // pending, queued, etc.
+        stats.pending += count;
+      }
+    });
+
+    // Refine "pending" vs "active" by checking if 'pending' ones have progress
+    const pendingWithProgress = await Meeting.countDocuments({
+      ...baseQuery,
+      status: 'pending',
+      $or: [
+        { 'processingMeta.progress': { $gt: 0 } },
+        { 'processingLogs.0': { $exists: true } }
+      ]
+    });
+    
+    if (pendingWithProgress > 0) {
+      stats.pending -= pendingWithProgress;
+      stats.active += pendingWithProgress;
+    }
+
+    res.json({
+      success: true,
+      data: stats
+    });
+  } catch (error) {
+    logger.error('Error getting meeting stats:', error);
     next(error);
   }
 }

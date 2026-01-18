@@ -29,6 +29,7 @@ const {
   clearChatHistory,
   togglePin,
   getPinnedMeetings,
+  getMeetingStats,
 } = require('../controllers/meetingController');
 
 const router = express.Router();
@@ -38,6 +39,12 @@ const router = express.Router();
  * Get all pinned meetings for current user
  */
 router.get('/pinned', authenticate, asyncHandler(getPinnedMeetings));
+
+/**
+ * GET /api/meetings/stats
+ * Get meeting statistics
+ */
+router.get('/stats', authenticate, asyncHandler(getMeetingStats));
 
 /**
  * GET /api/meetings
